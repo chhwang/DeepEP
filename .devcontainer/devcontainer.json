@@ -1,0 +1,33 @@
+{
+    "name": "DeepEP Dev Container",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "args": {
+            "BASE_IMAGE": "superbench/superbench:v0.11.0-cuda12.4"
+        }
+    },
+    "remoteUser": "devuser",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                // Python
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                // C++
+                "ms-vscode.cpptools",
+                "ms-vscode.cpptools-extension-pack",
+                "ms-vscode.cmake-tools"
+            ]
+        }
+    },
+    "privileged": true,
+    "runArgs": [
+        "--net=host",
+        "--ipc=host",
+        "--gpus=all",
+        "--ulimit=memlock=-1:-1",
+        "--volume=/mnt:/mnt"
+    ],
+    "workspaceFolder": "/home/devuser/deepep",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/home/devuser/deepep,type=bind,consistency=cached"
+}
