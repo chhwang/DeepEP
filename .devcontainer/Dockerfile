@@ -3,6 +3,7 @@ FROM ${BASE_IMAGE}
 ARG USERNAME=devuser
 ARG USER_UID=1000
 ARG USER_GID=$USER_UID
+ARG SSH_PORT=22345
 
 # Create the user
 RUN groupadd --gid $USER_GID $USERNAME && \
@@ -23,10 +24,13 @@ RUN apt-get update && \
         libtsan2 \
         distro-info-data \
         dkms \
+        openssh-server \
         && \
     ls -al /.devcontainer && \
     dpkg -i /.devcontainer/*.deb && \
-    apt-get clean
+    apt-get autoremove && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/*
 
 RUN curl -L -o nvshmem_src.txz https://developer.nvidia.com/downloads/assets/secure/nvshmem/nvshmem_src_3.2.5-1.txz && \
     tar -xvf nvshmem_src.txz && \
@@ -47,5 +51,9 @@ RUN curl -L -o nvshmem_src.txz https://developer.nvidia.com/downloads/assets/sec
     make -j$(nproc) && \
     make install && \
     rm -rf /.devcontainer
+
+RUN sed -i "s/^Port 22/Port ${SSH_PORT}/" /etc/ssh/sshd_config && \
+    ssh-keygen -t rsa -f ~/.ssh/id_rsa -N "" -q && \
+    cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
 
 USER $USERNAME

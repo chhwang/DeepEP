@@ -29,5 +29,6 @@
         "--volume=/mnt:/mnt"
     ],
     "workspaceFolder": "/home/devuser/deepep",
-    "workspaceMount": "source=${localWorkspaceFolder},target=/home/devuser/deepep,type=bind,consistency=cached"
+    "workspaceMount": "source=${localWorkspaceFolder},target=/home/devuser/deepep,type=bind,consistency=cached",
+    "postStartCommand": "sudo service ssh start"
 }
