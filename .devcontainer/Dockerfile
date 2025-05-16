@@ -53,7 +53,9 @@ RUN curl -L -o nvshmem_src.txz https://developer.nvidia.com/downloads/assets/sec
     rm -rf /.devcontainer
 
 RUN sed -i "s/^Port 22/Port ${SSH_PORT}/" /etc/ssh/sshd_config && \
-    ssh-keygen -t rsa -f ~/.ssh/id_rsa -N "" -q && \
-    cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+    mkdir -p /home/$USERNAME/.ssh && \
+    ssh-keygen -t rsa -f /home/$USERNAME/.ssh/id_rsa -N "" -q && \
+    cat /home/$USERNAME/.ssh/id_rsa.pub >> /home/$USERNAME/.ssh/authorized_keys && \
+    chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh
 
 USER $USERNAME
