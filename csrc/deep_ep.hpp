@@ -10,6 +10,7 @@
 #include <torch/types.h>
 #include <tuple>
 #include <vector>
+#include <mscclpp/core.hpp>
 
 #include "config.hpp"
 #include "event.hpp"
@@ -71,6 +72,9 @@ private:
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
 
+    std::shared_ptr<mscclpp::TcpBootstrap> bootstrap;
+    std::shared_ptr<mscclpp::Communicator> communicator;
+
 private:
     void move_fifo_slots(int num_slots = 1);
 
@@ -96,6 +100,10 @@ public:
     pybind11::bytearray get_local_nvshmem_unique_id() const;
 
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
+
+    mscclpp::UniqueId create_unique_id() const;
+
+    void connect(mscclpp::UniqueId root_id);
 
     void sync(const std::vector<int>& device_ids, const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles, const std::optional<pybind11::bytearray>& root_unique_id_opt);
 

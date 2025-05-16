@@ -6,6 +6,7 @@
 #include <memory>
 #include <pybind11/functional.h>
 #include <torch/python.h>
+#include <mscclpp/core.hpp>
 
 #include "deep_ep.hpp"
 #include "kernels/api.cuh"
@@ -17,7 +18,8 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         rank(rank), num_ranks(num_ranks),
         num_nvl_bytes(num_nvl_bytes), num_rdma_bytes(num_rdma_bytes),
         low_latency_mode(low_latency_mode),
-        comm_stream(at::cuda::getStreamFromPool(true)) {
+        comm_stream(at::cuda::getStreamFromPool(true)),
+        bootstrap(std::make_shared<mscclpp::TcpBootstrap>(rank, num_ranks)) {
     // Task fifo memory
     int64_t fifo_bytes = sizeof(int) * NUM_MAX_FIFO_SLOTS;
     int64_t buffer_ptr_bytes = sizeof(void*) * NUM_MAX_NVL_PEERS;
@@ -158,6 +160,15 @@ torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int
     auto base_ptr = reinterpret_cast<uint8_t*>(use_rdma_buffer ? rdma_buffer_ptr : buffer_ptrs[nvl_rank]) + offset;
     auto num_bytes = use_rdma_buffer ? num_rdma_bytes : num_nvl_bytes;
     return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
+}
+
+mscclpp::UniqueId Buffer::create_unique_id() const {
+    return bootstrap->createUniqueId();
+}
+
+void Buffer::connect(mscclpp::UniqueId root_id) {
+    bootstrap->initialize(root_id);
+    communicator = std::make_shared<mscclpp::Communicator>(bootstrap);
 }
 
 void Buffer::sync(const std::vector<int> &device_ids,
@@ -1231,6 +1242,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_ipc_handle", &deep_ep::Buffer::get_local_ipc_handle)
         .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
         .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
+        .def("create_unique_id", &deep_ep::Buffer::create_unique_id)
+        .def("connect", &deep_ep::Buffer::connect)
         .def("sync", &deep_ep::Buffer::sync)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
