@@ -28,6 +28,7 @@ RUN apt-get update && \
         && \
     ls -al /.devcontainer && \
     dpkg -i /.devcontainer/*.deb && \
+    echo 'options nvidia NVreg_EnableStreamMemOPs=1 NVreg_RegistryDwords="PeerMappingOverride=1;"' >> /etc/modprobe.d/nvidia.conf && \
     apt-get autoremove && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/*
