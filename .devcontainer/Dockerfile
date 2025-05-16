@@ -32,12 +32,17 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/*
 
+RUN cd /.devcontainer && \
+    git clone https://github.com/NVIDIA/gdrcopy.git && \
+    cd gdrcopy && \
+    git checkout v2.5
+
 RUN curl -L -o nvshmem_src.txz https://developer.nvidia.com/downloads/assets/secure/nvshmem/nvshmem_src_3.2.5-1.txz && \
     tar -xvf nvshmem_src.txz && \
     cd nvshmem_src && \
     git apply /.devcontainer/nvshmem.patch && \
     CUDA_HOME=/usr/local/cuda \
-        GDRCOPY_HOME=/tmp/gdrcopy \
+        GDRCOPY_HOME=/.devcontainer/gdrcopy \
         NVSHMEM_SHMEM_SUPPORT=0 \
         NVSHMEM_UCX_SUPPORT=0 \
         NVSHMEM_USE_NCCL=0 \

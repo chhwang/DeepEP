@@ -26,7 +26,8 @@
         "--ipc=host",
         "--gpus=all",
         "--ulimit=memlock=-1:-1",
-        "--volume=/mnt:/mnt"
+        "--volume=/mnt:/mnt",
+        "--volume=/dev:/dev"
     ],
     "workspaceFolder": "/home/devuser/deepep",
     "workspaceMount": "source=${localWorkspaceFolder},target=/home/devuser/deepep,type=bind,consistency=cached",
