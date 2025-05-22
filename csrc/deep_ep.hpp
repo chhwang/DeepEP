@@ -11,6 +11,7 @@
 #include <tuple>
 #include <vector>
 #include <mscclpp/core.hpp>
+#include <mscclpp/port_channel.hpp>
 
 #include "config.hpp"
 #include "event.hpp"
@@ -73,7 +74,10 @@ private:
     int* moe_recv_rdma_counter_mapped = nullptr;
 
     std::shared_ptr<mscclpp::TcpBootstrap> bootstrap;
+    std::shared_ptr<mscclpp::ProxyService> proxy_service;
     std::shared_ptr<mscclpp::Communicator> communicator;
+    std::vector<mscclpp::PortChannel> port_channels;
+    std::shared_ptr<mscclpp::PortChannelDeviceHandle> port_channel_handles_device_ptr;
 
 private:
     void move_fifo_slots(int num_slots = 1);

@@ -4,6 +4,7 @@
 #include "launch.cuh"
 #include "utils.cuh"
 #include "ibgda_device.cuh"
+#include <mscclpp/port_channel_device.hpp>
 
 namespace deep_ep {
 
@@ -209,7 +210,8 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                 int* gbl_channel_prefix_matrix, int* recv_gbl_rank_prefix_sum,
                 void* rdma_buffer_ptr,
                 void** buffer_ptrs, int** task_fifo_ptrs, int head, int rank,
-                const nvshmem_team_t rdma_team) {
+                const nvshmem_team_t rdma_team,
+                mscclpp::PortChannelDeviceHandle* port_channel_handles) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
     auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
@@ -230,7 +232,10 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
 
         // Send numbers of tokens per rank/expert to RDMA ranks
         auto rdma_buffer_ptr_int = reinterpret_cast<int*>(rdma_buffer_ptr);
-        auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS + num_rdma_experts + 1, kNumRDMARanks);
+        auto num_elems = NUM_MAX_NVL_PEERS + num_rdma_experts + 1;
+        auto num_bytes = num_elems * sizeof(int);
+        auto per_channel_bytes = num_bytes * kNumRDMARanks;
+        auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr, num_elems, kNumRDMARanks);
 
         // Clean up for later data dispatch
         EP_DEVICE_ASSERT(rdma_recv_num_tokens_mixed.total_bytes <= rdma_clean_offset * sizeof(int));
@@ -253,6 +258,15 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         // TODO: more light fence or barrier or signaling
         // TODO: overlap EP barrier and NVL cleaning
         if (thread_id < kNumRDMARanks) {
+        // if (thread_id < kNumRDMARanks - 1 && num_bytes > 0) {
+            auto dst_rdma_rank = thread_id < rdma_rank ? thread_id : thread_id + 1;
+            auto dst_offset = rdma_rank * num_bytes + per_channel_bytes;
+            auto src_offset = dst_rdma_rank * num_bytes;
+            auto peer = dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank;
+            assert(peer != rank);
+            // assert(thread_id == 0);
+            // printf("peer %d, dst_offset %lu, src_offset %lu, num_bytes %lu\n", translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank), (unsigned long)dst_offset, (unsigned long)src_offset, (unsigned long)num_bytes);
+            // port_channel_handles[peer].put(dst_offset, src_offset, num_bytes);
             nvshmem_int_put_nbi(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank), rdma_recv_num_tokens_mixed.send_buffer(thread_id),
                                 NUM_MAX_NVL_PEERS + num_rdma_experts + 1,
                                 translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank));
@@ -412,7 +426,8 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                      void** buffer_ptrs, int num_max_nvl_chunked_recv_tokens,
                      int** task_fifo_ptrs, int head, int rank,
                      cudaStream_t stream, int64_t num_rdma_bytes, int64_t num_nvl_bytes,
-                     bool low_latency_mode) {
+                     bool low_latency_mode,
+                     mscclpp::PortChannelDeviceHandle *port_channel_handles) {
 #define NOTIFY_DISPATCH_LAUNCH_CASE(num_rdma_ranks) { \
     auto notify_dispatch_func = low_latency_mode ? \
         notify_dispatch<true, num_rdma_ranks> : notify_dispatch<false, num_rdma_ranks>; \
@@ -427,7 +442,8 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                   gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
                   rdma_buffer_ptr, \
                   buffer_ptrs, task_fifo_ptrs, head, rank, \
-                  cpu_rdma_team); } break
+                  cpu_rdma_team, \
+                  port_channel_handles); } break
 
     constexpr int kNumThreads = 512;
     const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
@@ -464,7 +480,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
          const bool* is_token_in_rank,
          void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
          void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
-         int rank, int num_ranks) {
+         int rank, int num_ranks,
+         mscclpp::PortChannelDeviceHandle *port_channel_handles) {
     enum class WarpRole {
         kRDMASender,
         kRDMASenderCoordinator,
@@ -1053,7 +1070,8 @@ void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float*
               void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
               void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
               int rank, int num_ranks, bool is_cached_dispatch,
-              cudaStream_t stream, int num_channels, bool low_latency_mode) {
+              cudaStream_t stream, int num_channels, bool low_latency_mode,
+              mscclpp::PortChannelDeviceHandle *port_channel_handles) {
     constexpr int kNumDispatchRDMASenderWarps = 7;
 
 #define DISPATCH_LAUNCH_CASE(num_rdma_ranks) { \
@@ -1071,7 +1089,8 @@ void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float*
                   is_token_in_rank, \
                   rdma_buffer_ptr, num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens, \
                   buffer_ptrs, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, \
-                  rank, num_ranks); } break
+                  rank, num_ranks, \
+                  port_channel_handles); } break
 
     EP_HOST_ASSERT((topk_idx == nullptr)  == (topk_weights == nullptr));
     EP_HOST_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));

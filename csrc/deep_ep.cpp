@@ -6,7 +6,7 @@
 #include <memory>
 #include <pybind11/functional.h>
 #include <torch/python.h>
-#include <mscclpp/core.hpp>
+#include <mscclpp/gpu_utils.hpp>
 
 #include "deep_ep.hpp"
 #include "kernels/api.cuh"
@@ -19,7 +19,8 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         num_nvl_bytes(num_nvl_bytes), num_rdma_bytes(num_rdma_bytes),
         low_latency_mode(low_latency_mode),
         comm_stream(at::cuda::getStreamFromPool(true)),
-        bootstrap(std::make_shared<mscclpp::TcpBootstrap>(rank, num_ranks)) {
+        bootstrap(std::make_shared<mscclpp::TcpBootstrap>(rank, num_ranks)),
+        proxy_service(std::make_shared<mscclpp::ProxyService>()) {
     // Task fifo memory
     int64_t fifo_bytes = sizeof(int) * NUM_MAX_FIFO_SLOTS;
     int64_t buffer_ptr_bytes = sizeof(void*) * NUM_MAX_NVL_PEERS;
@@ -78,9 +79,13 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_rdma_counter_mapped, const_cast<int*>(moe_recv_rdma_counter), 0));
         *moe_recv_rdma_counter = -1;
     }
+
+    proxy_service->startProxy();
 }
 
 Buffer::~Buffer() noexcept(false) {
+    proxy_service->stopProxy();
+
     // Synchronize
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -211,6 +216,8 @@ void Buffer::sync(const std::vector<int> &device_ids,
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
         internode::barrier();
 
+        // printf("[rank %d] num_rdma_bytes: %ld\n", rank, num_rdma_bytes);
+
         // Allocate
         rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
 
@@ -220,6 +227,35 @@ void Buffer::sync(const std::vector<int> &device_ids,
         // Barrier
         internode::barrier();
         CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<mscclpp::Transport> ib_transports = {mscclpp::Transport::IB0, mscclpp::Transport::IB1,
+            mscclpp::Transport::IB2, mscclpp::Transport::IB3, mscclpp::Transport::IB4,
+            mscclpp::Transport::IB5, mscclpp::Transport::IB6, mscclpp::Transport::IB7};
+        auto ib_transport = ib_transports[device_id];
+        auto rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, ib_transport);
+        auto src_mem_id = proxy_service->addMemory(rdma_buffer_mem);
+
+        std::vector<std::shared_future<std::shared_ptr<mscclpp::Connection>>> connection_futures(num_ranks);
+        std::vector<std::shared_future<mscclpp::RegisteredMemory>> remote_mem_futures(num_ranks);
+        for (int r = 0; r < num_ranks; ++r) {
+            if (r == rank) continue;
+            connection_futures[r] = communicator->connect(r, 0, ib_transport);
+            communicator->sendMemory(rdma_buffer_mem, r, 0);
+            remote_mem_futures[r] = communicator->recvMemory(r, 0);
+        }
+        std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles(num_ranks);
+        for (int r = 0; r < num_ranks; ++r) {
+            if (r == rank) continue;
+            auto sema_id = proxy_service->buildAndAddSemaphore(*communicator, connection_futures[r].get());
+            auto dst_mem_id = proxy_service->addMemory(remote_mem_futures[r].get());
+            port_channels.emplace_back(proxy_service->portChannel(sema_id, dst_mem_id, src_mem_id));
+            port_channel_handles[r] = port_channels.rbegin()->deviceHandle();
+        }
+
+        port_channel_handles_device_ptr = mscclpp::detail::gpuCallocShared<mscclpp::PortChannelDeviceHandle>(num_ranks);
+        mscclpp::gpuMemcpy<mscclpp::PortChannelDeviceHandle>(
+            port_channel_handles_device_ptr.get(), port_channel_handles.data(), num_ranks,
+            cudaMemcpyHostToDevice);
     }
 
     // Ready to use
@@ -775,7 +811,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                    buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                                    task_fifo_ptrs_gpu, head, rank, comm_stream,
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                                   num_nvl_bytes, low_latency_mode);
+                                   num_nvl_bytes, low_latency_mode, port_channel_handles_device_ptr.get());
         move_fifo_slots(3);
 
         // Synchronize total received tokens and tokens per expert
@@ -852,7 +888,8 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                         rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
                         buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
                         rank, num_ranks, cached_mode,
-                        comm_stream, num_channels, low_latency_mode);
+                        comm_stream, num_channels, low_latency_mode,
+                        port_channel_handles_device_ptr.get());
 
     // Wait streams
     std::optional<EventHandle> event;
