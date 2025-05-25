@@ -232,23 +232,31 @@ void Buffer::sync(const std::vector<int> &device_ids,
             mscclpp::Transport::IB2, mscclpp::Transport::IB3, mscclpp::Transport::IB4,
             mscclpp::Transport::IB5, mscclpp::Transport::IB6, mscclpp::Transport::IB7};
         auto ib_transport = ib_transports[device_id];
-        auto rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, ib_transport);
+        mscclpp::TransportFlags transport = mscclpp::TransportFlags(ib_transport) | mscclpp::Transport::CudaIpc;
+        auto rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, transport);
         auto src_mem_id = proxy_service->addMemory(rdma_buffer_mem);
 
         std::vector<std::shared_future<std::shared_ptr<mscclpp::Connection>>> connection_futures(num_ranks);
         std::vector<std::shared_future<mscclpp::RegisteredMemory>> remote_mem_futures(num_ranks);
         for (int r = 0; r < num_ranks; ++r) {
-            if (r == rank) continue;
-            connection_futures[r] = communicator->connect(r, 0, ib_transport);
-            communicator->sendMemory(rdma_buffer_mem, r, 0);
-            remote_mem_futures[r] = communicator->recvMemory(r, 0);
+            if (r == rank) {
+                // self connection
+                connection_futures[r] = communicator->connect(rank, 0, mscclpp::Transport::CudaIpc);
+            } else {
+                connection_futures[r] = communicator->connect(r, 0, ib_transport);
+                communicator->sendMemory(rdma_buffer_mem, r, 0);
+                remote_mem_futures[r] = communicator->recvMemory(r, 0);
+            }
         }
         std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles(num_ranks);
         for (int r = 0; r < num_ranks; ++r) {
-            if (r == rank) continue;
             auto sema_id = proxy_service->buildAndAddSemaphore(*communicator, connection_futures[r].get());
-            auto dst_mem_id = proxy_service->addMemory(remote_mem_futures[r].get());
-            port_channels.emplace_back(proxy_service->portChannel(sema_id, dst_mem_id, src_mem_id));
+            if (r == rank) {
+                port_channels.emplace_back(proxy_service->portChannel(sema_id, src_mem_id, src_mem_id));
+            } else {
+                auto dst_mem_id = proxy_service->addMemory(remote_mem_futures[r].get());
+                port_channels.emplace_back(proxy_service->portChannel(sema_id, dst_mem_id, src_mem_id));
+            }
             port_channel_handles[r] = port_channels.rbegin()->deviceHandle();
         }
 
