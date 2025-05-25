@@ -258,18 +258,16 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         // TODO: more light fence or barrier or signaling
         // TODO: overlap EP barrier and NVL cleaning
         if (thread_id < kNumRDMARanks) {
-        // if (thread_id < kNumRDMARanks - 1 && num_bytes > 0) {
-            auto dst_rdma_rank = thread_id < rdma_rank ? thread_id : thread_id + 1;
+            auto dst_rdma_rank = thread_id;
             auto dst_offset = rdma_rank * num_bytes + per_channel_bytes;
             auto src_offset = dst_rdma_rank * num_bytes;
             auto peer = dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank;
-            assert(peer != rank);
-            // assert(thread_id == 0);
-            // printf("peer %d, dst_offset %lu, src_offset %lu, num_bytes %lu\n", translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank), (unsigned long)dst_offset, (unsigned long)src_offset, (unsigned long)num_bytes);
-            // port_channel_handles[peer].put(dst_offset, src_offset, num_bytes);
-            nvshmem_int_put_nbi(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank), rdma_recv_num_tokens_mixed.send_buffer(thread_id),
-                                NUM_MAX_NVL_PEERS + num_rdma_experts + 1,
-                                translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank));
+            // nvshmem_int_put_nbi(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank), rdma_recv_num_tokens_mixed.send_buffer(thread_id),
+            //                     NUM_MAX_NVL_PEERS + num_rdma_experts + 1,
+            //                     translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank));
+            port_channel_handles[peer].putWithSignal(dst_offset, src_offset, num_bytes);
+            port_channel_handles[peer].wait();
+            // need a flush somewhere
         }
         __syncthreads();
         if (thread_id == 0)
