@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <mscclpp/port_channel_device.hpp>
+#include <mscclpp/memory_channel_device.hpp>
 
 namespace deep_ep {
 
@@ -88,7 +89,8 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                      int** task_fifo_ptrs, int head, int rank,
                      cudaStream_t stream, int64_t num_rdma_bytes, int64_t num_nvl_bytes,
                      bool low_latency_mode,
-                     mscclpp::PortChannelDeviceHandle* port_channel_handles);
+                     mscclpp::PortChannelDeviceHandle* port_channel_handles,
+                     mscclpp::MemoryChannelDeviceHandle* memory_channel_handles);
 
 void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv_topk_weights, void* recv_src_meta,
               const void* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
@@ -102,7 +104,8 @@ void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float*
               void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
               int rank, int num_ranks, bool is_cached_dispatch,
               cudaStream_t stream, int num_channels, bool low_latency_mode,
-              mscclpp::PortChannelDeviceHandle* port_channel_handles);
+              mscclpp::PortChannelDeviceHandle* port_channel_handles,
+              mscclpp::MemoryChannelDeviceHandle* memory_channel_handles);
 
 void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights,
                    int num_ranks, int num_channels, int num_combined_tokens, int* combined_rdma_head,

@@ -12,6 +12,7 @@
 #include <vector>
 #include <mscclpp/core.hpp>
 #include <mscclpp/port_channel.hpp>
+#include <mscclpp/memory_channel.hpp>
 
 #include "config.hpp"
 #include "event.hpp"
@@ -77,7 +78,9 @@ private:
     std::shared_ptr<mscclpp::ProxyService> proxy_service;
     std::shared_ptr<mscclpp::Communicator> communicator;
     std::vector<mscclpp::PortChannel> port_channels;
+    std::vector<mscclpp::MemoryChannel> memory_channels;
     std::shared_ptr<mscclpp::PortChannelDeviceHandle> port_channel_handles_device_ptr;
+    std::shared_ptr<mscclpp::MemoryChannelDeviceHandle> memory_channel_handles_device_ptr;
 
 private:
     void move_fifo_slots(int num_slots = 1);

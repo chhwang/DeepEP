@@ -181,6 +181,13 @@ void Buffer::sync(const std::vector<int> &device_ids,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
     EP_HOST_ASSERT(not is_available());
 
+    const std::vector<mscclpp::Transport> ib_transports = {mscclpp::Transport::IB0, mscclpp::Transport::IB1,
+        mscclpp::Transport::IB2, mscclpp::Transport::IB3, mscclpp::Transport::IB4,
+        mscclpp::Transport::IB5, mscclpp::Transport::IB6, mscclpp::Transport::IB7};
+    const auto ipc_transport = mscclpp::Transport::CudaIpc;
+    const auto ib_transport = ib_transports[device_id];
+    const mscclpp::TransportFlags all_transport = ipc_transport | ib_transport;
+
     // Sync IPC handles
     if (num_nvl_bytes > 0) {
         EP_HOST_ASSERT(num_ranks == device_ids.size());
@@ -202,6 +209,45 @@ void Buffer::sync(const std::vector<int> &device_ids,
         CUDA_CHECK(cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs, sizeof(void*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(task_fifo_ptrs_gpu, task_fifo_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaDeviceSynchronize());
+
+        // create connections
+        std::vector<std::shared_ptr<mscclpp::Connection>> connections;
+        {
+            std::vector<std::shared_future<std::shared_ptr<mscclpp::Connection>>> connection_futures;
+            for (int i = 0; i < num_nvl_ranks; ++i) {
+                auto r = i + rdma_rank * num_nvl_ranks;
+                connection_futures.emplace_back(communicator->connect(r, 0, ipc_transport));
+            }
+            for (auto& future : connection_futures) {
+                connections.emplace_back(future.get());
+            }
+        }
+
+        auto buffer_mem = communicator->registerMemory(buffer_ptrs[nvl_rank], num_nvl_bytes, ipc_transport);
+
+        std::vector<std::shared_future<mscclpp::RegisteredMemory>> remote_mem_futures(num_nvl_ranks);
+        for (int i = 0; i < num_nvl_ranks; ++i) {
+            if (i == nvl_rank) continue;
+            auto r = i + rdma_rank * num_nvl_ranks;
+            communicator->sendMemory(buffer_mem, r, 0);
+            remote_mem_futures[i] = communicator->recvMemory(r, 0);
+        }
+        for (int i = 0; i < num_nvl_ranks; ++i) {
+            if (i == nvl_rank) continue;
+            auto r = i + rdma_rank * num_nvl_ranks;
+            auto sema = std::make_shared<mscclpp::MemoryDevice2DeviceSemaphore>(*communicator, connections[i]);
+            memory_channels.emplace_back(sema, remote_mem_futures[i].get(), buffer_mem.data());
+        }
+        std::vector<mscclpp::MemoryChannelDeviceHandle> memory_channel_handles(num_nvl_ranks);
+        for (int i = 0; i < num_nvl_ranks; ++i) {
+            if (i == nvl_rank) continue;
+            memory_channel_handles[i] = memory_channels.rbegin()->deviceHandle();
+        }
+
+        memory_channel_handles_device_ptr = mscclpp::detail::gpuCallocShared<mscclpp::MemoryChannelDeviceHandle>(num_nvl_ranks);
+        mscclpp::gpuMemcpy<mscclpp::MemoryChannelDeviceHandle>(
+            memory_channel_handles_device_ptr.get(), memory_channel_handles.data(), num_nvl_ranks,
+            cudaMemcpyHostToDevice);
     }
 
     // Sync NVSHMEM handles and allocate memory
@@ -216,8 +262,6 @@ void Buffer::sync(const std::vector<int> &device_ids,
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
         internode::barrier();
 
-        // printf("[rank %d] num_rdma_bytes: %ld\n", rank, num_rdma_bytes);
-
         // Allocate
         rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
 
@@ -228,29 +272,41 @@ void Buffer::sync(const std::vector<int> &device_ids,
         internode::barrier();
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        std::vector<mscclpp::Transport> ib_transports = {mscclpp::Transport::IB0, mscclpp::Transport::IB1,
-            mscclpp::Transport::IB2, mscclpp::Transport::IB3, mscclpp::Transport::IB4,
-            mscclpp::Transport::IB5, mscclpp::Transport::IB6, mscclpp::Transport::IB7};
-        auto ib_transport = ib_transports[device_id];
-        mscclpp::TransportFlags transport = mscclpp::TransportFlags(ib_transport) | mscclpp::Transport::CudaIpc;
-        auto rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, transport);
+        // create connections
+        std::vector<std::shared_ptr<mscclpp::Connection>> connections;
+        {
+            std::vector<std::shared_future<std::shared_ptr<mscclpp::Connection>>> connection_futures;
+            for (int r = 0; r < num_ranks; ++r) {
+                mscclpp::Transport transport;
+                if (r == rank) {
+                    // self connection
+                    transport = ipc_transport;
+                } else if ((r / NUM_MAX_NVL_PEERS) == rdma_rank) {
+                    // same node: either IPC or IB are fine
+                    transport = ipc_transport;
+                } else {
+                    // different node
+                    transport = ib_transport;
+                }
+                connection_futures.emplace_back(communicator->connect(r, 0, transport));
+            }
+            for (auto& future : connection_futures) {
+                connections.emplace_back(future.get());
+            }
+        }
+
+        auto rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, all_transport);
         auto src_mem_id = proxy_service->addMemory(rdma_buffer_mem);
 
-        std::vector<std::shared_future<std::shared_ptr<mscclpp::Connection>>> connection_futures(num_ranks);
         std::vector<std::shared_future<mscclpp::RegisteredMemory>> remote_mem_futures(num_ranks);
         for (int r = 0; r < num_ranks; ++r) {
-            if (r == rank) {
-                // self connection
-                connection_futures[r] = communicator->connect(rank, 0, mscclpp::Transport::CudaIpc);
-            } else {
-                connection_futures[r] = communicator->connect(r, 0, ib_transport);
-                communicator->sendMemory(rdma_buffer_mem, r, 0);
-                remote_mem_futures[r] = communicator->recvMemory(r, 0);
-            }
+            if (r == rank) continue;
+            communicator->sendMemory(rdma_buffer_mem, r, 0);
+            remote_mem_futures[r] = communicator->recvMemory(r, 0);
         }
         std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles(num_ranks);
         for (int r = 0; r < num_ranks; ++r) {
-            auto sema_id = proxy_service->buildAndAddSemaphore(*communicator, connection_futures[r].get());
+            auto sema_id = proxy_service->buildAndAddSemaphore(*communicator, connections[r]);
             if (r == rank) {
                 port_channels.emplace_back(proxy_service->portChannel(sema_id, src_mem_id, src_mem_id));
             } else {
@@ -819,7 +875,8 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                    buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                                    task_fifo_ptrs_gpu, head, rank, comm_stream,
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                                   num_nvl_bytes, low_latency_mode, port_channel_handles_device_ptr.get());
+                                   num_nvl_bytes, low_latency_mode, port_channel_handles_device_ptr.get(),
+                                   memory_channel_handles_device_ptr.get());
         move_fifo_slots(3);
 
         // Synchronize total received tokens and tokens per expert
@@ -897,7 +954,8 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                         buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
                         rank, num_ranks, cached_mode,
                         comm_stream, num_channels, low_latency_mode,
-                        port_channel_handles_device_ptr.get());
+                        port_channel_handles_device_ptr.get(),
+                        memory_channel_handles_device_ptr.get());
 
     // Wait streams
     std::optional<EventHandle> event;
