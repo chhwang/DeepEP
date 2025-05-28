@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cuda_runtime.h>
+#include <map>
 #include <memory>
 #include <pybind11/functional.h>
 #include <torch/python.h>
@@ -272,53 +273,73 @@ void Buffer::sync(const std::vector<int> &device_ids,
         internode::barrier();
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // create connections
-        std::vector<std::shared_ptr<mscclpp::Connection>> connections;
-        {
-            std::vector<std::shared_future<std::shared_ptr<mscclpp::Connection>>> connection_futures;
-            for (int r = 0; r < num_ranks; ++r) {
-                mscclpp::Transport transport;
-                if (r == rank) {
-                    // self connection
-                    transport = ipc_transport;
-                } else if ((r / NUM_MAX_NVL_PEERS) == rdma_rank) {
-                    // same node: either IPC or IB are fine
-                    transport = ipc_transport;
-                } else {
-                    // different node
-                    transport = ib_transport;
-                }
-                connection_futures.emplace_back(communicator->connect(r, 0, transport));
-            }
-            for (auto& future : connection_futures) {
-                connections.emplace_back(future.get());
-            }
-        }
+        // Rank -> RDMA buffer IDs
+        std::map<int, mscclpp::MemoryId> memory_ids;
 
-        auto rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, all_transport);
-        auto src_mem_id = proxy_service->addMemory(rdma_buffer_mem);
+        // Register local memory
+        auto local_rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, all_transport);
+        memory_ids[rank] = proxy_service->addMemory(local_rdma_buffer_mem);
 
-        std::vector<std::shared_future<mscclpp::RegisteredMemory>> remote_mem_futures(num_ranks);
+        // Send local memory to other ranks. If low_latency_mode == false, only send to ranks with the same GPU ID.
         for (int r = 0; r < num_ranks; ++r) {
             if (r == rank) continue;
-            communicator->sendMemory(rdma_buffer_mem, r, 0);
-            remote_mem_futures[r] = communicator->recvMemory(r, 0);
-        }
-        std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles(num_ranks);
-        for (int r = 0; r < num_ranks; ++r) {
-            auto sema_id = proxy_service->buildAndAddSemaphore(*communicator, connections[r]);
-            if (r == rank) {
-                port_channels.emplace_back(proxy_service->portChannel(sema_id, src_mem_id, src_mem_id));
-            } else {
-                auto dst_mem_id = proxy_service->addMemory(remote_mem_futures[r].get());
-                port_channels.emplace_back(proxy_service->portChannel(sema_id, dst_mem_id, src_mem_id));
-            }
-            port_channel_handles[r] = port_channels.rbegin()->deviceHandle();
+            if (!low_latency_mode && ((r % NUM_MAX_NVL_PEERS) != (rank % NUM_MAX_NVL_PEERS))) continue;
+            communicator->sendMemory(local_rdma_buffer_mem, r, 0);
         }
 
-        port_channel_handles_device_ptr = mscclpp::detail::gpuCallocShared<mscclpp::PortChannelDeviceHandle>(num_ranks);
+        // Receive remote memory from other ranks
+        for (int r = 0; r < num_ranks; ++r) {
+            if (r == rank) continue;
+            if (!low_latency_mode && ((r % NUM_MAX_NVL_PEERS) != (rank % NUM_MAX_NVL_PEERS))) continue;
+            memory_ids[r] = proxy_service->addMemory(communicator->recvMemory(r, 0).get());
+        }
+
+        // Rank -> vector of connection futures
+        std::unordered_map<int, std::vector<std::shared_future<std::shared_ptr<mscclpp::Connection>>>> connection_futures;
+
+        // Create a self connection to local memory
+        connection_futures[rank].emplace_back(communicator->connect(rank, 0, ipc_transport));
+
+        // Create connections to each remote memory
+        const int num_ib_connections_per_rank = low_latency_mode ? 2 : 2;  // #QPs per rank
+        for (auto& [r, memory_id] : memory_ids) {
+            if (r == rank) continue;
+            for (int i = 0; i < num_ib_connections_per_rank; ++i) {
+                connection_futures[r].emplace_back(communicator->connect(r, 0, ib_transport));
+            }
+        }
+
+        // Rank -> vector of semphore IDs
+        std::unordered_map<int, std::vector<mscclpp::SemaphoreId>> sema_ids;
+
+        // Create semaphores for each connection
+        const int num_semaphores_per_rank = 16;
+        for (int i = 0; i < num_semaphores_per_rank; ++i) {
+            for (auto& [r, conn_futures] : connection_futures) {
+                auto conn_future = conn_futures[i % conn_futures.size()];
+                auto sema_id = proxy_service->buildAndAddSemaphore(*communicator, conn_future.get());
+                sema_ids[r].emplace_back(sema_id);
+            }
+        }
+
+        // Create port channels and port channel handles.
+        // If low_latency_mode is true, the length of `port_channel_handles` will be
+        // `num_ranks * num_port_channels_per_rank`, otherwise it will be
+        // `num_rdma_ranks * num_port_channels_per_rank`.
+        const int num_port_channels_per_rank = num_semaphores_per_rank;
+        std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles;
+        for (int i = 0; i < num_port_channels_per_rank; ++i) {
+            for (auto& [r, memory_id] : memory_ids) {
+                auto sema_id = sema_ids[r][i % sema_ids[r].size()];
+                auto port_channel = proxy_service->portChannel(sema_id, memory_id, memory_ids[rank]);
+                port_channels.emplace_back(std::move(port_channel));
+                port_channel_handles.emplace_back(port_channels.rbegin()->deviceHandle());
+            }
+        }
+
+        port_channel_handles_device_ptr = mscclpp::detail::gpuCallocShared<mscclpp::PortChannelDeviceHandle>(port_channel_handles.size());
         mscclpp::gpuMemcpy<mscclpp::PortChannelDeviceHandle>(
-            port_channel_handles_device_ptr.get(), port_channel_handles.data(), num_ranks,
+            port_channel_handles_device_ptr.get(), port_channel_handles.data(), port_channel_handles.size(),
             cudaMemcpyHostToDevice);
     }
 
