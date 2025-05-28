@@ -84,8 +84,6 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
 }
 
 Buffer::~Buffer() noexcept(false) {
-    proxy_service->stopProxy();
-
     // Synchronize
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -112,6 +110,8 @@ Buffer::~Buffer() noexcept(false) {
         internode::free(rdma_buffer_ptr);
         internode::finalize();
     }
+
+    proxy_service->stopProxy();
 
     // Free cuBLAS handle, workspace and MoE counter
     CUDA_CHECK(cudaFree(workspace));
