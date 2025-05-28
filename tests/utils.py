@@ -17,7 +17,7 @@ def set_numa_affinity(rank):
     cores_per_rank = 12
     numa_node = rank // 4
     core_start = rank * cores_per_rank
-    core_end = core_start  cores_per_rank
+    core_end = core_start + cores_per_rank
     p = psutil.Process(os.getpid())
     p.cpu_affinity(list(range(core_start, core_end)))
     print(f"Rank {rank} numa node {numa_node} bound to cores {core_start}-{core_end - 1}")
