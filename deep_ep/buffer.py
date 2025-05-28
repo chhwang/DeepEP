@@ -72,8 +72,8 @@ class Buffer:
             os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
             os.environ['NVSHMEM_IBGDA_NIC_HANDLER'] = 'gpu'
             os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
-+           os.environ['NVSHMEM_ENABLE_NIC_PE_MAPPING'] = '1'
-+           os.environ['NVSHMEM_HCA_LIST'] = 'mlx5_ib0:1,mlx5_ib1:1,mlx5_ib2:1,mlx5_ib3:1,mlx5_ib4:1,mlx5_ib5:1,mlx5_ib6:1,mlx5_ib7:1'
+            os.environ['NVSHMEM_ENABLE_NIC_PE_MAPPING'] = '1'
+            os.environ['NVSHMEM_HCA_LIST'] = 'mlx5_ib0:1,mlx5_ib1:1,mlx5_ib2:1,mlx5_ib3:1,mlx5_ib4:1,mlx5_ib5:1,mlx5_ib6:1,mlx5_ib7:1'
             # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
             os.environ['NVSHMEM_QP_DEPTH'] = '1024'
             # NOTES: NVSHMEM initialization requires at least 256 MiB
