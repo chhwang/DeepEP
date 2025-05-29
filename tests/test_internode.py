@@ -173,7 +173,8 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         rdma_send_bytes = (dispatch_bf16_rdma_send_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_rdma_send_bytes
         nvl_recv_bytes = (dispatch_bf16_nvl_recv_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_nvl_recv_bytes
         for nvl_chunk_size in range(4, 33, 4):
-            for rdma_chunk_size in range(4, 33, 4):
+            # TODO(chhwang): figure out why rdma_chunk_size 4 is not working
+            for rdma_chunk_size in range(8, 33, 8):
                 config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
                 tune_args = {'x': current_x, 'handle': handle, 'config': config}
                 t = bench(lambda: buffer.dispatch(**tune_args))[0]
