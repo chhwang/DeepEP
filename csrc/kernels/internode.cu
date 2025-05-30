@@ -756,48 +756,37 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     continue;
 
                 // Issue RDMA send
-                auto num_tokens_to_issue = min(num_tokens_processed, num_max_rdma_chunked_send_tokens);
+                int num_tokens_to_issue = min(num_tokens_processed, num_max_rdma_chunked_send_tokens);
                 EP_DEVICE_ASSERT(num_tokens_to_issue >= 0 and num_tokens_to_issue <= synced_num_tokens_to_send);
+                if (num_tokens_to_issue == 0) continue;
 
-                if (dst_rdma_rank != rdma_rank) {
-                    if (lane_id == 0) {
-                        auto dst_slot_idx = synced_last_issued_tail % num_max_rdma_chunked_recv_tokens;
-                        // EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= num_max_rdma_chunked_recv_tokens);
-                        const size_t num_bytes_per_msg = num_bytes_per_rdma_token * num_tokens_to_issue;
-                        // const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + dst_slot_idx * num_bytes_per_rdma_token);
-                        // const auto src_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + dst_slot_idx * num_bytes_per_rdma_token);
-
-                        auto dst_offset = rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + dst_slot_idx * num_bytes_per_rdma_token + data_recv_offset;
-                        auto src_offset = dst_rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + dst_slot_idx * num_bytes_per_rdma_token + data_send_offset;
-                        auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
-                        // EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + dst_offset == (const char*)dst_ptr);
-                        // EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + src_offset == (const char*)src_ptr);
-                        port_channel_handles[port_channel_idx].put(dst_offset, src_offset, num_bytes_per_msg);
-                        // TODO(chhwang): why is flush needed here?
-                        port_channel_handles[port_channel_idx].flush();
-                    }
-                    __syncwarp();
-                } else {
+                if (dst_rdma_rank == rdma_rank) {
                     // Lighter fence for local RDMA rank
                     memory_fence();
-                }
-
-                // Update tails
-                __syncwarp();
-                if (lane_id == dst_rdma_rank && num_tokens_to_issue > 0) {
+                    __syncwarp();
+                    if (lane_id == dst_rdma_rank) {
+                        // Update tails
+                        last_issued_tail += num_tokens_to_issue;
+                        num_tokens_to_send -= num_tokens_to_issue;
+                        mscclpp::atomicFetchAdd(reinterpret_cast<uint64_t*>(rdma_channel_tail.buffer(rdma_rank)), (uint64_t)num_tokens_to_issue, mscclpp::memoryOrderRelease);
+                    }
+                } else if (lane_id == dst_rdma_rank) {
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue;
-                    if (dst_rdma_rank == rdma_rank) {
-                        mscclpp::atomicFetchAdd(static_cast<uint64_t*>(rdma_channel_tail.buffer(rdma_rank)), (uint64_t)num_tokens_to_issue, mscclpp::memoryOrderRelease);
-                    } else {
-                        auto dst_offset = rdma_rank * sizeof(uint64_t) + tail_send_offset;
-                        auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
-                        auto& handle = port_channel_handles[port_channel_idx];
-                        mscclpp::ChannelTrigger trigger(0, handle.dst_, dst_offset, 0, 0, 1, handle.semaphoreId_);
-                        trigger.value.fst = num_tokens_to_issue;
-                        port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
-                    }
+
+                    const auto dst_slot_idx = synced_last_issued_tail % num_max_rdma_chunked_recv_tokens;
+                    const size_t num_bytes_per_msg = num_bytes_per_rdma_token * num_tokens_to_issue;
+                    const auto dst_offset = rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + dst_slot_idx * num_bytes_per_rdma_token + data_recv_offset;
+                    const auto src_offset = dst_rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + dst_slot_idx * num_bytes_per_rdma_token + data_send_offset;
+                    const auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
+                    auto& handle = port_channel_handles[port_channel_idx];
+                    handle.put(dst_offset, src_offset, num_bytes_per_msg);
+
+                    mscclpp::ChannelTrigger trigger(0, handle.dst_, rdma_rank * sizeof(uint64_t) + tail_send_offset, 0, 0, 1, handle.semaphoreId_);
+                    trigger.value.fst = num_tokens_to_issue;
+                    handle.fifo_.push(trigger.value);
                 }
+                __syncwarp();
             }
         }
     } else if (warp_role == WarpRole::kRDMAAndNVLForwarder) {
@@ -1004,7 +993,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     auto& handle = port_channel_handles[port_channel_idx];
                     mscclpp::ChannelTrigger trigger(0, handle.dst_, dst_offset, 0, 0, 1, handle.semaphoreId_);
                     trigger.value.fst = min_head - last_head;
-                    port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
+                    handle.fifo_.push(trigger.value);
                 }
                 last_head = min_head;
             }
@@ -1660,36 +1649,26 @@ combine(int4* combined_x, float* combined_topk_weights,
 
                 // Issue RDMA send
                 if (sub_warp_id == kNumWarpsPerForwarder - 1) {
-                    if (dst_rdma_rank != rdma_rank) {
-                        if (lane_id == 0) {
-                            auto rdma_slot_idx = token_start_idx % num_max_rdma_chunked_recv_tokens;
-                            const size_t num_bytes_per_msg = num_chunked_tokens * num_bytes_per_rdma_token;
-                            auto dst_offset = rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + rdma_slot_idx * num_bytes_per_rdma_token + data_recv_offset;
-                            auto src_offset = dst_rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + rdma_slot_idx * num_bytes_per_rdma_token + data_send_offset;
-                            auto port_channel_idx = kLowLatencyMode ? dst_rdma_rank : (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
-                            port_channel_handles[port_channel_idx].put(dst_offset, src_offset, num_bytes_per_msg);
-                            // TODO(chhwang): why is flush needed here?
-                            port_channel_handles[port_channel_idx].flush();
-                        }
-                        __syncwarp();
-                    } else {
+                    if (dst_rdma_rank == rdma_rank) {
                         memory_fence();
-                    }
-
-                    // Write new RDMA tail
-                    __syncwarp();
-                    if (lane_id == 0) {
-                        if (dst_rdma_rank == rdma_rank) {
-                            mscclpp::atomicFetchAdd(static_cast<uint64_t*>(rdma_channel_tail.buffer(rdma_rank)), (uint64_t)num_chunked_tokens, mscclpp::memoryOrderRelease);
-                        } else {
-                            auto dst_offset = rdma_rank * sizeof(uint64_t) + tail_send_offset;
-                            auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
-                            auto& handle = port_channel_handles[port_channel_idx];
-                            mscclpp::ChannelTrigger trigger(0, handle.dst_, dst_offset, 0, 0, 1, handle.semaphoreId_);
-                            trigger.value.fst = num_chunked_tokens;
-                            port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
+                        __syncwarp();
+                        if (lane_id == 0) {
+                            mscclpp::atomicFetchAdd(reinterpret_cast<uint64_t*>(rdma_channel_tail.buffer(rdma_rank)), (uint64_t)num_chunked_tokens, mscclpp::memoryOrderRelease);
                         }
+                    } else if (lane_id == 0) {
+                        auto rdma_slot_idx = token_start_idx % num_max_rdma_chunked_recv_tokens;
+                        const size_t num_bytes_per_msg = num_chunked_tokens * num_bytes_per_rdma_token;
+                        auto dst_offset = rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + rdma_slot_idx * num_bytes_per_rdma_token + data_recv_offset;
+                        auto src_offset = dst_rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + rdma_slot_idx * num_bytes_per_rdma_token + data_send_offset;
+                        auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
+                        auto& handle = port_channel_handles[port_channel_idx];
+                        handle.put(dst_offset, src_offset, num_bytes_per_msg);
+
+                        mscclpp::ChannelTrigger trigger(0, handle.dst_, rdma_rank * sizeof(uint64_t) + tail_send_offset, 0, 0, 1, handle.semaphoreId_);
+                        trigger.value.fst = num_chunked_tokens;
+                        handle.fifo_.push(trigger.value);
                     }
+                    __syncwarp();
                 }
             }
 
@@ -1782,7 +1761,7 @@ combine(int4* combined_x, float* combined_topk_weights,
                             auto& handle = port_channel_handles[port_channel_idx];
                             mscclpp::ChannelTrigger trigger(0, handle.dst_, dst_offset, 0, 0, 1, handle.semaphoreId_);
                             trigger.value.fst = min_head - last_rdma_head;
-                            port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
+                            handle.fifo_.push(trigger.value);
                         }
                         last_rdma_head = min_head;
                     }
