@@ -14,7 +14,7 @@ if __name__ == '__main__':
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable',
                  '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3', '-rdc=true', '--ptxas-options=--register-usage-level=10']
-    include_dirs = ['csrc/', f'{nvshmem_dir}/include']
+    include_dirs = ['csrc/', f'{nvshmem_dir}/include', os.path.abspath('third-party/mscclpp/include')]
     sources = ['csrc/deep_ep.cpp',
                'csrc/kernels/runtime.cu', 'csrc/kernels/intranode.cu',
                'csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu']

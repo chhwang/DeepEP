@@ -1,0 +1,3 @@
+[submodule "third-party/mscclpp"]
+	path = third-party/mscclpp
+	url = https://github.com/microsoft/mscclpp
