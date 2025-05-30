@@ -3,7 +3,6 @@
 #include "exception.cuh"
 #include "launch.cuh"
 #include "utils.cuh"
-#include "ibgda_device.cuh"
 #include <mscclpp/port_channel_device.hpp>
 #include <mscclpp/memory_channel_device.hpp>
 
@@ -194,11 +193,6 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
     return kLowLatencyMode ? (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank) : dst_rdma_rank;
 }
 
-template <bool kLowLatencyMode>
-__forceinline__ __device__ void nvshmem_barrier_with_same_gpu_idx(const nvshmem_team_t& rdma_team) {
-    kLowLatencyMode ? void(nvshmem_barrier(rdma_team)) : nvshmem_barrier_all();
-}
-
 template <bool kLowLatencyMode, int kNumRDMARanks>
 __global__ void
 notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
@@ -211,7 +205,6 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                 int* gbl_channel_prefix_matrix, int* recv_gbl_rank_prefix_sum,
                 void* rdma_buffer_ptr,
                 void** buffer_ptrs, int** task_fifo_ptrs, int head, int rank,
-                const nvshmem_team_t rdma_team,
                 mscclpp::PortChannelDeviceHandle* port_channel_handles,
                 mscclpp::MemoryChannelDeviceHandle *memory_channel_handles) {
     auto sm_id = static_cast<int>(blockIdx.x);
@@ -461,7 +454,6 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                   gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
                   rdma_buffer_ptr, \
                   buffer_ptrs, task_fifo_ptrs, head, rank, \
-                  cpu_rdma_team, \
                   port_channel_handles, memory_channel_handles); } break
 
     constexpr int kNumThreads = 512;
@@ -511,16 +503,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     };
 
     const auto sm_id = static_cast<int>(blockIdx.x);
-    const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
     const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
     const auto num_channels = static_cast<int>(gridDim.x) / 2, channel_id = sm_id / 2;
     const bool is_forwarder = sm_id % 2 == 0;
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
-    const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-
-    char *rdma_buffer_ptr_orig = (char*)rdma_buffer_ptr;
-
-    EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= num_channels);
 
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
         if (is_forwarder) {
@@ -560,19 +546,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     auto meta_recv_offset = meta_offset + sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2) * kNumRDMARanks * (channel_id + num_channels);
     auto head_offset = meta_offset + sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2) * kNumRDMARanks * num_channels * 2;
     auto head_send_offset = head_offset + sizeof(uint64_t) * kNumRDMARanks * channel_id;
-    auto head_recv_offset = head_offset + sizeof(uint64_t) * kNumRDMARanks * (channel_id + num_channels);
     auto tail_offset = head_offset + sizeof(uint64_t) * kNumRDMARanks * num_channels;
     auto tail_send_offset = tail_offset + sizeof(uint64_t) * kNumRDMARanks * channel_id;
-    auto tail_recv_offset = tail_offset + sizeof(uint64_t) * kNumRDMARanks * (channel_id + num_channels);
-    auto num_tokens_to_issue_offset = tail_offset + sizeof(uint64_t) * kNumRDMARanks * num_channels;
-    auto num_tokens_to_issue_send_offset = num_tokens_to_issue_offset + sizeof(int) * kNumRDMARanks * channel_id;
-    auto num_tokens_to_issue_recv_offset = num_tokens_to_issue_offset + sizeof(int) * kNumRDMARanks * (channel_id + num_channels);
-    int *num_tokens_to_issue_send_ptr = reinterpret_cast<int*>(rdma_buffer_ptr_orig + num_tokens_to_issue_send_offset);
-    int *num_tokens_to_issue_recv_ptr = reinterpret_cast<int*>(rdma_buffer_ptr_orig + num_tokens_to_issue_recv_offset);
-    EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + data_send_offset == (const char*)rdma_channel_data.send_buffer(0));
-    EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + data_recv_offset == (const char*)rdma_channel_data.recv_buffer(0));
-    EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + meta_send_offset == (const char*)rdma_channel_meta.send_buffer(0));
-    EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + meta_recv_offset == (const char*)rdma_channel_meta.recv_buffer(0));
 
     // NVL buffer layouts
     // NOTES: `rs_wr_buffer_ptr` means "Read for Senders, Write for Receivers", `ws_rr_buffer_ptr` means "Write for Senders, Read for Receivers"
@@ -633,7 +608,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
             // Issue RDMA for non-local ranks
             if (dst_rdma_rank != rdma_rank) {
-#if 1
                 if (lane_id == 0) {
                     auto num_bytes = sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2);
                     auto dst_offset = rdma_rank * num_bytes + meta_recv_offset;
@@ -644,13 +618,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     port_channel_handles[port_channel_idx].put(dst_offset, src_offset, num_bytes);
                 }
                 __syncwarp();
-#else
-                nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank)),
-                                                  reinterpret_cast<uint64_t>(rdma_channel_meta.send_buffer(dst_rdma_rank)),
-                                                  sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2),
-                                                  translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
-                                                  channel_id, lane_id, 0);
-#endif
             }
         }
         sync_rdma_sender_smem();
@@ -795,7 +762,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 EP_DEVICE_ASSERT(num_tokens_to_issue >= 0 and num_tokens_to_issue <= synced_num_tokens_to_send);
 
                 if (dst_rdma_rank != rdma_rank) {
-#if 1
                     if (lane_id == 0) {
                         auto dst_slot_idx = synced_last_issued_tail % num_max_rdma_chunked_recv_tokens;
                         // EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= num_max_rdma_chunked_recv_tokens);
@@ -813,15 +779,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                         port_channel_handles[port_channel_idx].flush();
                     }
                     __syncwarp();
-#else
-                    auto dst_slot_idx = synced_last_issued_tail % num_max_rdma_chunked_recv_tokens;
-                    EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= num_max_rdma_chunked_recv_tokens);
-                    const size_t num_bytes_per_msg = num_bytes_per_rdma_token * num_tokens_to_issue;
-                    const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + dst_slot_idx * num_bytes_per_rdma_token);
-                    const auto src_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + dst_slot_idx * num_bytes_per_rdma_token);
-                    nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, src_ptr, num_bytes_per_msg,
-                                                      translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, lane_id, 0);
-#endif
                 } else {
                     // Lighter fence for local RDMA rank
                     memory_fence();
@@ -832,7 +789,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 if (lane_id == dst_rdma_rank && num_tokens_to_issue > 0) {
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue;
-#if 1
                     if (dst_rdma_rank == rdma_rank) {
                         mscclpp::atomicFetchAdd(static_cast<uint64_t*>(rdma_channel_tail.buffer(rdma_rank)), (uint64_t)num_tokens_to_issue, mscclpp::memoryOrderRelease);
                     } else {
@@ -843,10 +799,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                         trigger.value.fst = num_tokens_to_issue;
                         port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
                     }
-#else
-                    nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
-                                                    translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
-#endif
                 }
             }
         }
@@ -1046,7 +998,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
             // Update remote head
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + num_max_rdma_chunked_send_tokens and lane_id < kNumRDMARanks) {
-#if 1
                 if (lane_id == rdma_rank) {
                     mscclpp::atomicFetchAdd(static_cast<uint64_t*>(rdma_channel_head.buffer(rdma_rank)), (uint64_t)(min_head - last_head), mscclpp::memoryOrderRelease);
                 } else {
@@ -1057,10 +1008,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     trigger.value.fst = min_head - last_head;
                     port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
                 }
-#else
-                nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank), min_head - last_head,
-                                                translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank), channel_id, lane_id == rdma_rank);
-#endif
                 last_head = min_head;
             }
 
@@ -1212,13 +1159,12 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
                               const int* rdma_channel_prefix_matrix, const int* rdma_rank_prefix_sum, int* combined_nvl_head,
                               void* rdma_buffer_ptr,
                               void** buffer_ptrs, int** task_fifo_ptrs, int head, int rank, int num_ranks,
-                              bool is_cached_dispatch, const nvshmem_team_t rdma_team,
+                              bool is_cached_dispatch,
                               mscclpp::PortChannelDeviceHandle *port_channel_handles,
                               mscclpp::MemoryChannelDeviceHandle *memory_channel_handles) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x);
     auto num_threads = static_cast<int>(blockDim.x);
-    auto num_warps = num_threads / 32;
     auto warp_id = thread_id / 32;
     auto lane_id = get_lane_id();
 
@@ -1358,7 +1304,7 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_to
                   rdma_channel_prefix_matrix, rdma_rank_prefix_sum, combined_nvl_head,
                   rdma_buffer_ptr,
                   buffer_ptrs, task_fifo_ptrs, head, rank, num_ranks,
-                  is_cached_dispatch, cpu_rdma_team,
+                  is_cached_dispatch,
                   port_channel_handles, memory_channel_handles);
 }
 
@@ -1449,7 +1395,6 @@ combine(int4* combined_x, float* combined_topk_weights,
     };
 
     const auto sm_id = static_cast<int>(blockIdx.x);
-    const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const auto num_channels = static_cast<int>(gridDim.x) / 2, channel_id = sm_id / 2;
     const bool is_rdma_receiver_sm = sm_id % 2 == 1;
@@ -1595,10 +1540,8 @@ combine(int4* combined_x, float* combined_topk_weights,
         auto data_recv_offset = sizeof(int8_t) * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) * kNumRDMARanks * (channel_id + num_channels);
         auto head_offset = sizeof(int8_t) * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) * kNumRDMARanks * num_channels * 2;
         auto head_send_offset = head_offset + sizeof(uint64_t) * kNumRDMARanks * channel_id;
-        auto head_recv_offset = head_offset + sizeof(uint64_t) * kNumRDMARanks * (channel_id + num_channels);
         auto tail_offset = head_offset + sizeof(uint64_t) * kNumRDMARanks * num_channels;
         auto tail_send_offset = tail_offset + sizeof(uint64_t) * kNumRDMARanks * channel_id;
-        auto tail_recv_offset = tail_offset + sizeof(uint64_t) * kNumRDMARanks * (channel_id + num_channels);
 
         // NVL layouts
         void* local_nvl_buffer = buffer_ptrs[nvl_rank];
@@ -1720,7 +1663,6 @@ combine(int4* combined_x, float* combined_topk_weights,
                 // Issue RDMA send
                 if (sub_warp_id == kNumWarpsPerForwarder - 1) {
                     if (dst_rdma_rank != rdma_rank) {
-#if 1
                         if (lane_id == 0) {
                             auto rdma_slot_idx = token_start_idx % num_max_rdma_chunked_recv_tokens;
                             const size_t num_bytes_per_msg = num_chunked_tokens * num_bytes_per_rdma_token;
@@ -1732,14 +1674,6 @@ combine(int4* combined_x, float* combined_topk_weights,
                             port_channel_handles[port_channel_idx].flush();
                         }
                         __syncwarp();
-#else
-                        auto rdma_slot_idx = token_start_idx % num_max_rdma_chunked_recv_tokens;
-                        const size_t num_bytes_per_msg = num_chunked_tokens * num_bytes_per_rdma_token;
-                        const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token);
-                        const auto src_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token);
-                        nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, src_ptr, num_bytes_per_msg,
-                                                          translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, lane_id, 0);
-#endif
                     } else {
                         memory_fence();
                     }
@@ -1747,7 +1681,6 @@ combine(int4* combined_x, float* combined_topk_weights,
                     // Write new RDMA tail
                     __syncwarp();
                     if (lane_id == 0) {
-#if 1
                         if (dst_rdma_rank == rdma_rank) {
                             mscclpp::atomicFetchAdd(static_cast<uint64_t*>(rdma_channel_tail.buffer(rdma_rank)), (uint64_t)num_chunked_tokens, mscclpp::memoryOrderRelease);
                         } else {
@@ -1758,10 +1691,6 @@ combine(int4* combined_x, float* combined_topk_weights,
                             trigger.value.fst = num_chunked_tokens;
                             port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
                         }
-#else
-                        nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_chunked_tokens,
-                                                        translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
-#endif
                     }
                 }
             }
@@ -1847,7 +1776,6 @@ combine(int4* combined_x, float* combined_topk_weights,
                     for (int i = 0; i < kNumRDMAReceivers; ++ i) if (not rdma_receiver_retired[i])
                         min_head = min(min_head, rdma_receiver_rdma_head[i][dst_rdma_rank]);
                     if (min_head != std::numeric_limits<int>::max() and min_head >= last_rdma_head + num_max_rdma_chunked_send_tokens and lane_id < kNumRDMARanks) {
-#if 1
                         if (dst_rdma_rank == rdma_rank) {
                             mscclpp::atomicFetchAdd(static_cast<uint64_t*>(rdma_channel_head.buffer(rdma_rank)), (uint64_t)(min_head - last_rdma_head), mscclpp::memoryOrderRelease);
                         } else {
@@ -1858,10 +1786,6 @@ combine(int4* combined_x, float* combined_topk_weights,
                             trigger.value.fst = min_head - last_rdma_head;
                             port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
                         }
-#else
-                        nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank), min_head - last_rdma_head,
-                                                        translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
-#endif
                         last_rdma_head = min_head;
                     }
                 } else {
