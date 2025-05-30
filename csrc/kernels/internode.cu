@@ -638,7 +638,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     auto num_bytes = sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2);
                     auto dst_offset = rdma_rank * num_bytes + meta_recv_offset;
                     auto src_offset = dst_rdma_rank * num_bytes + meta_send_offset;
-                    auto port_channel_idx = kLowLatencyMode ? dst_rdma_rank : (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
+                    auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
                     // EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + dst_offset == (const char*)rdma_channel_meta.recv_buffer(rdma_rank));
                     // EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + src_offset == (const char*)rdma_channel_meta.send_buffer(dst_rdma_rank));
                     port_channel_handles[port_channel_idx].put(dst_offset, src_offset, num_bytes);
@@ -805,7 +805,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
                         auto dst_offset = rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + dst_slot_idx * num_bytes_per_rdma_token + data_recv_offset;
                         auto src_offset = dst_rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + dst_slot_idx * num_bytes_per_rdma_token + data_send_offset;
-                        auto port_channel_idx = kLowLatencyMode ? dst_rdma_rank : (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
+                        auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
                         // EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + dst_offset == (const char*)dst_ptr);
                         // EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + src_offset == (const char*)src_ptr);
                         port_channel_handles[port_channel_idx].put(dst_offset, src_offset, num_bytes_per_msg);
