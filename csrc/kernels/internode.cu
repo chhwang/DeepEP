@@ -829,11 +829,24 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
                 // Update tails
                 __syncwarp();
-                if (lane_id == dst_rdma_rank) {
+                if (lane_id == dst_rdma_rank && num_tokens_to_issue > 0) {
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue;
+#if 1
+                    if (dst_rdma_rank == rdma_rank) {
+                        mscclpp::atomicFetchAdd(static_cast<uint64_t*>(rdma_channel_tail.buffer(rdma_rank)), (uint64_t)num_tokens_to_issue, mscclpp::memoryOrderRelease);
+                    } else {
+                        auto dst_offset = rdma_rank * sizeof(uint64_t) + tail_send_offset;
+                        auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
+                        auto& handle = port_channel_handles[port_channel_idx];
+                        mscclpp::ChannelTrigger trigger(0, handle.dst_, dst_offset, 0, 0, 1, handle.semaphoreId_);
+                        trigger.value.fst = num_tokens_to_issue;
+                        port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
+                    }
+#else
                     nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue,
                                                     translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
+#endif
                 }
             }
         }
@@ -1033,8 +1046,21 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
             // Update remote head
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + num_max_rdma_chunked_send_tokens and lane_id < kNumRDMARanks) {
+#if 1
+                if (lane_id == rdma_rank) {
+                    mscclpp::atomicFetchAdd(static_cast<uint64_t*>(rdma_channel_head.buffer(rdma_rank)), (uint64_t)(min_head - last_head), mscclpp::memoryOrderRelease);
+                } else {
+                    auto dst_offset = rdma_rank * sizeof(uint64_t) + head_send_offset;
+                    auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + lane_id) : (channel_id * num_ranks + lane_id * NUM_MAX_NVL_PEERS + nvl_rank);
+                    auto& handle = port_channel_handles[port_channel_idx];
+                    mscclpp::ChannelTrigger trigger(0, handle.dst_, dst_offset, 0, 0, 1, handle.semaphoreId_);
+                    trigger.value.fst = min_head - last_head;
+                    port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
+                }
+#else
                 nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank), min_head - last_head,
                                                 translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank), channel_id, lane_id == rdma_rank);
+#endif
                 last_head = min_head;
             }
 
@@ -1567,6 +1593,12 @@ combine(int4* combined_x, float* combined_topk_weights,
 
         auto data_send_offset = sizeof(int8_t) * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) * kNumRDMARanks * channel_id;
         auto data_recv_offset = sizeof(int8_t) * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) * kNumRDMARanks * (channel_id + num_channels);
+        auto head_offset = sizeof(int8_t) * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) * kNumRDMARanks * num_channels * 2;
+        auto head_send_offset = head_offset + sizeof(uint64_t) * kNumRDMARanks * channel_id;
+        auto head_recv_offset = head_offset + sizeof(uint64_t) * kNumRDMARanks * (channel_id + num_channels);
+        auto tail_offset = head_offset + sizeof(uint64_t) * kNumRDMARanks * num_channels;
+        auto tail_send_offset = tail_offset + sizeof(uint64_t) * kNumRDMARanks * channel_id;
+        auto tail_recv_offset = tail_offset + sizeof(uint64_t) * kNumRDMARanks * (channel_id + num_channels);
 
         // NVL layouts
         void* local_nvl_buffer = buffer_ptrs[nvl_rank];
@@ -1715,8 +1747,21 @@ combine(int4* combined_x, float* combined_topk_weights,
                     // Write new RDMA tail
                     __syncwarp();
                     if (lane_id == 0) {
+#if 1
+                        if (dst_rdma_rank == rdma_rank) {
+                            mscclpp::atomicFetchAdd(static_cast<uint64_t*>(rdma_channel_tail.buffer(rdma_rank)), (uint64_t)num_chunked_tokens, mscclpp::memoryOrderRelease);
+                        } else {
+                            auto dst_offset = rdma_rank * sizeof(uint64_t) + tail_send_offset;
+                            auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
+                            auto& handle = port_channel_handles[port_channel_idx];
+                            mscclpp::ChannelTrigger trigger(0, handle.dst_, dst_offset, 0, 0, 1, handle.semaphoreId_);
+                            trigger.value.fst = num_chunked_tokens;
+                            port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
+                        }
+#else
                         nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank), num_chunked_tokens,
                                                         translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
+#endif
                     }
                 }
             }
@@ -1802,8 +1847,21 @@ combine(int4* combined_x, float* combined_topk_weights,
                     for (int i = 0; i < kNumRDMAReceivers; ++ i) if (not rdma_receiver_retired[i])
                         min_head = min(min_head, rdma_receiver_rdma_head[i][dst_rdma_rank]);
                     if (min_head != std::numeric_limits<int>::max() and min_head >= last_rdma_head + num_max_rdma_chunked_send_tokens and lane_id < kNumRDMARanks) {
+#if 1
+                        if (dst_rdma_rank == rdma_rank) {
+                            mscclpp::atomicFetchAdd(static_cast<uint64_t*>(rdma_channel_head.buffer(rdma_rank)), (uint64_t)(min_head - last_rdma_head), mscclpp::memoryOrderRelease);
+                        } else {
+                            auto dst_offset = rdma_rank * sizeof(uint64_t) + head_send_offset;
+                            auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
+                            auto& handle = port_channel_handles[port_channel_idx];
+                            mscclpp::ChannelTrigger trigger(0, handle.dst_, dst_offset, 0, 0, 1, handle.semaphoreId_);
+                            trigger.value.fst = min_head - last_rdma_head;
+                            port_channel_handles[port_channel_idx].fifo_.push(trigger.value);
+                        }
+#else
                         nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank), min_head - last_rdma_head,
                                                         translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), channel_id, dst_rdma_rank == rdma_rank);
+#endif
                         last_rdma_head = min_head;
                     }
                 } else {

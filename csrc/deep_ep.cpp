@@ -15,13 +15,36 @@
 
 namespace deep_ep {
 
+class EPProxyService : public mscclpp::ProxyService {
+public:
+    EPProxyService(size_t fifoSize = 512);
+};
+
+EPProxyService::EPProxyService(size_t fifoSize) : mscclpp::ProxyService(fifoSize) {
+    // Overwrite the default proxy
+    proxy_ = std::make_shared<mscclpp::Proxy>(
+        [&](mscclpp::ProxyTrigger triggerRaw) {
+            auto trigger = reinterpret_cast<mscclpp::ChannelTrigger*>(&triggerRaw);
+            if (trigger->fields.type == 0x0) {  // regard 0x0 as an IB atomicAdd request
+                auto semaphore = semaphores_[trigger->fields.semaphoreId];
+                auto& dst = memories_[trigger->fields.dstMemoryId];
+                uint64_t value = triggerRaw.fst;
+                semaphore->connection()->atomicAdd(dst, trigger->fields.dstOffset, value);
+                inflightRequests_[semaphore->connection()]++;
+            }
+            return this->handleTrigger(triggerRaw);
+        },
+        [&]() { this->bindThread(); }, fifoSize
+    );
+}
+
 Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode):
         rank(rank), num_ranks(num_ranks),
         num_nvl_bytes(num_nvl_bytes), num_rdma_bytes(num_rdma_bytes),
         low_latency_mode(low_latency_mode),
         comm_stream(at::cuda::getStreamFromPool(true)),
         bootstrap(std::make_shared<mscclpp::TcpBootstrap>(rank, num_ranks)),
-        proxy_service(std::make_shared<mscclpp::ProxyService>(512)) {
+        proxy_service(std::make_shared<EPProxyService>()) {
     // Task fifo memory
     int64_t fifo_bytes = sizeof(int) * NUM_MAX_FIFO_SLOTS;
     int64_t buffer_ptr_bytes = sizeof(void*) * NUM_MAX_NVL_PEERS;
@@ -301,7 +324,7 @@ void Buffer::sync(const std::vector<int> &device_ids,
         connection_futures[rank].emplace_back(communicator->connect(rank, 0, ipc_transport));
 
         // Create connections to each remote memory
-        const int num_ib_connections_per_rank = low_latency_mode ? 1 : 1;  // #QPs per rank
+        const int num_ib_connections_per_rank = low_latency_mode ? 12 : 12;  // #QPs per rank
         for (auto& [r, memory_id] : memory_ids) {
             if (r == rank) continue;
             for (int i = 0; i < num_ib_connections_per_rank; ++i) {
