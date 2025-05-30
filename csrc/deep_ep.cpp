@@ -280,17 +280,17 @@ void Buffer::sync(const std::vector<int> &device_ids,
         auto local_rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, all_transport);
         memory_ids[rank] = proxy_service->addMemory(local_rdma_buffer_mem);
 
-        // Send local memory to other ranks. If low_latency_mode == false, only send to ranks with the same GPU ID.
+        // Send local memory to other ranks. If low_latency_mode == true, only send to ranks with the same GPU ID.
         for (int r = 0; r < num_ranks; ++r) {
             if (r == rank) continue;
-            if (!low_latency_mode && ((r % NUM_MAX_NVL_PEERS) != (rank % NUM_MAX_NVL_PEERS))) continue;
+            if (low_latency_mode && ((r % NUM_MAX_NVL_PEERS) != (rank % NUM_MAX_NVL_PEERS))) continue;
             communicator->sendMemory(local_rdma_buffer_mem, r, 0);
         }
 
-        // Receive remote memory from other ranks
+        // Receive remote memory from other ranks. If low_latency_mode == true, only send to ranks with the same GPU ID.
         for (int r = 0; r < num_ranks; ++r) {
             if (r == rank) continue;
-            if (!low_latency_mode && ((r % NUM_MAX_NVL_PEERS) != (rank % NUM_MAX_NVL_PEERS))) continue;
+            if (low_latency_mode && ((r % NUM_MAX_NVL_PEERS) != (rank % NUM_MAX_NVL_PEERS))) continue;
             memory_ids[r] = proxy_service->addMemory(communicator->recvMemory(r, 0).get());
         }
 
@@ -324,8 +324,8 @@ void Buffer::sync(const std::vector<int> &device_ids,
 
         // Create port channels and port channel handles.
         // If low_latency_mode is true, the length of `port_channel_handles` will be
-        // `num_ranks * num_port_channels_per_rank`, otherwise it will be
-        // `num_rdma_ranks * num_port_channels_per_rank`.
+        // `num_rdma_ranks * num_port_channels_per_rank`, otherwise it will be
+        // `num_ranks * num_port_channels_per_rank`.
         const int num_port_channels_per_rank = num_semaphores_per_rank;
         std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles;
         for (int i = 0; i < num_port_channels_per_rank; ++i) {

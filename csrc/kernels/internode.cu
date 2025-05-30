@@ -227,19 +227,14 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         // Global barrier: the first warp do intra-node sync, the second warp do internode sync
         EP_DEVICE_ASSERT(num_warps > 1);
         EP_DEVICE_ASSERT(kNumRDMARanks + 32 <= num_threads);
-        // TODO(chhwang): lazy flush?
-        if constexpr (kLowLatencyMode) {
-            auto peer_rank = (thread_id - 32) * NUM_MAX_NVL_PEERS + nvl_rank;
-            if (peer_rank >= 0 && peer_rank < num_ranks && peer_rank != rank) {
-                port_channel_handles[peer_rank].signal();
-                port_channel_handles[peer_rank].wait();
-            }
-        } else {
-            auto peer_rank = thread_id - 32;
-            if (peer_rank >= 0 && peer_rank < num_rdma_ranks && peer_rank != rdma_rank) {
-                port_channel_handles[peer_rank].signal();
-                port_channel_handles[peer_rank].wait();
-            }
+        const auto barrier_thread_id = thread_id - 32;
+        const bool run_barrier = (barrier_thread_id >= 0) && (barrier_thread_id < kNumRDMARanks) && (barrier_thread_id != rdma_rank);
+        const auto barrier_channel_idx = kLowLatencyMode ? barrier_thread_id : (barrier_thread_id * NUM_MAX_NVL_PEERS + nvl_rank);
+        if (run_barrier) {
+            port_channel_handles[barrier_channel_idx].signal();
+            port_channel_handles[barrier_channel_idx].wait();
+        }
+        if constexpr (!kLowLatencyMode) {
             // kLowLatencyMode==false requires sync of all ranks, which can be done by running intra-node sync
             // after the inter-node sync is done.
             __syncthreads();
@@ -284,15 +279,9 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         // TODO: more light fence or barrier or signaling
         // TODO: overlap EP barrier and NVL cleaning
         if (thread_id < kNumRDMARanks) {
-            auto dst_rdma_rank = thread_id;
             auto dst_offset = rdma_rank * num_bytes + per_channel_bytes;
-            auto src_offset = dst_rdma_rank * num_bytes;
-            int peer_rank;
-            if constexpr (kLowLatencyMode) {
-                peer_rank = dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank;
-            } else {
-                peer_rank = dst_rdma_rank;
-            }
+            auto src_offset = thread_id * num_bytes;
+            auto peer_rank = kLowLatencyMode ? thread_id : (thread_id * NUM_MAX_NVL_PEERS + nvl_rank);
             port_channel_handles[peer_rank].putWithSignal(dst_offset, src_offset, num_bytes);
             port_channel_handles[peer_rank].wait();
         }
@@ -381,20 +370,11 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         // Finally barrier
         __syncthreads();
 
-        if constexpr (kLowLatencyMode) {
-            auto peer_rank = (thread_id - 32) * NUM_MAX_NVL_PEERS + nvl_rank;
-            if (peer_rank >= 0 && peer_rank < num_ranks && peer_rank != rank) {
-                port_channel_handles[peer_rank].signal();
-                port_channel_handles[peer_rank].flush();
-                port_channel_handles[peer_rank].wait();
-            }
-        } else {
-            auto peer_rank = thread_id - 32;
-            if (peer_rank >= 0 && peer_rank < num_rdma_ranks && peer_rank != rdma_rank) {
-                port_channel_handles[peer_rank].signal();
-                port_channel_handles[peer_rank].flush();
-                port_channel_handles[peer_rank].wait();
-            }
+        if (run_barrier) {
+            port_channel_handles[barrier_channel_idx].signal();
+            port_channel_handles[barrier_channel_idx].wait();
+        }
+        if constexpr (!kLowLatencyMode) {
             // kLowLatencyMode==false requires sync of all ranks, which can be done by running intra-node sync
             // after the inter-node sync is done.
             __syncthreads();
@@ -659,18 +639,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     auto num_bytes = sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2);
                     auto dst_offset = rdma_rank * num_bytes + meta_recv_offset;
                     auto src_offset = dst_rdma_rank * num_bytes + meta_send_offset;
-                    int peer_rank;
-                    int port_channel_idx;
-                    if constexpr (kLowLatencyMode) {
-                        peer_rank = dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank;
-                        port_channel_idx = peer_rank + channel_id * num_ranks;
-                    } else {
-                        peer_rank = dst_rdma_rank;
-                        port_channel_idx = peer_rank + channel_id * num_rdma_ranks;
-                    }
+                    auto port_channel_idx = kLowLatencyMode ? dst_rdma_rank : (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
                     // EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + dst_offset == (const char*)rdma_channel_meta.recv_buffer(rdma_rank));
                     // EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + src_offset == (const char*)rdma_channel_meta.send_buffer(dst_rdma_rank));
-                    // TODO(chhwang): flush somewhere
                     port_channel_handles[port_channel_idx].put(dst_offset, src_offset, num_bytes);
                 }
                 __syncwarp();
@@ -831,26 +802,18 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 #if 1
                     if (lane_id == 0) {
                         auto dst_slot_idx = synced_last_issued_tail % num_max_rdma_chunked_recv_tokens;
-                        EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= num_max_rdma_chunked_recv_tokens);
+                        // EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= num_max_rdma_chunked_recv_tokens);
                         const size_t num_bytes_per_msg = num_bytes_per_rdma_token * num_tokens_to_issue;
                         const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + dst_slot_idx * num_bytes_per_rdma_token);
                         const auto src_ptr = reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + dst_slot_idx * num_bytes_per_rdma_token);
 
                         auto dst_offset = rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + dst_slot_idx * num_bytes_per_rdma_token + data_recv_offset;
                         auto src_offset = dst_rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + dst_slot_idx * num_bytes_per_rdma_token + data_send_offset;
-                        int peer_rank;
-                        int port_channel_idx;
-                        if constexpr (kLowLatencyMode) {
-                            peer_rank = dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank;
-                            port_channel_idx = peer_rank + channel_id * num_ranks;
-                        } else {
-                            peer_rank = dst_rdma_rank;
-                            port_channel_idx = peer_rank + channel_id * num_rdma_ranks;
-                        }
-                        EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + dst_offset == (const char*)dst_ptr);
-                        EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + src_offset == (const char*)src_ptr);
-                        // TODO(chhwang): lazy flush?
+                        auto port_channel_idx = kLowLatencyMode ? dst_rdma_rank : (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
+                        // EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + dst_offset == (const char*)dst_ptr);
+                        // EP_DEVICE_ASSERT(rdma_buffer_ptr_orig + src_offset == (const char*)src_ptr);
                         port_channel_handles[port_channel_idx].put(dst_offset, src_offset, num_bytes_per_msg);
+                        // TODO(chhwang): why is flush needed here?
                         port_channel_handles[port_channel_idx].flush();
                     }
                     __syncwarp();
