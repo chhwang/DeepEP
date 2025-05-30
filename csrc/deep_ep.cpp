@@ -873,7 +873,9 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                  buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                                  task_fifo_ptrs_gpu, head, rank, comm_stream,
                                  config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                                 num_nvl_bytes, true, low_latency_mode);
+                                 num_nvl_bytes, true, low_latency_mode,
+                                 port_channel_handles_device_ptr.get(),
+                                 memory_channel_handles_device_ptr.get());
         move_fifo_slots(2);
     } else {
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -1088,7 +1090,9 @@ Buffer::internode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                              buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                              task_fifo_ptrs_gpu, head, rank, comm_stream,
                              config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                             num_nvl_bytes, false, low_latency_mode);
+                             num_nvl_bytes, false, low_latency_mode,
+                             port_channel_handles_device_ptr.get(),
+                             memory_channel_handles_device_ptr.get());
     move_fifo_slots(2);
 
     // Launch data combine
@@ -1102,7 +1106,9 @@ Buffer::internode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                        num_tokens, num_combined_tokens, hidden, num_topk,
                        rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
                        buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
-                       rank, num_ranks, comm_stream, num_channels, low_latency_mode);
+                       rank, num_ranks, comm_stream, num_channels, low_latency_mode,
+                       port_channel_handles_device_ptr.get(),
+                       memory_channel_handles_device_ptr.get());
 
     // Wait streams
     std::optional<EventHandle> event;

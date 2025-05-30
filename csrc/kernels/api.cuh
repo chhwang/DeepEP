@@ -114,7 +114,9 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_to
                    void** buffer_ptrs, int num_max_nvl_chunked_recv_tokens,
                    int** task_fifo_ptrs, int head, int rank, cudaStream_t stream,
                    int64_t num_rdma_bytes, int64_t num_nvl_bytes,
-                   bool is_cached_dispatch, bool low_latency_mode);
+                   bool is_cached_dispatch, bool low_latency_mode,
+                   mscclpp::PortChannelDeviceHandle* port_channel_handles,
+                   mscclpp::MemoryChannelDeviceHandle* memory_channel_handles);
 
 void combine(cudaDataType_t type,
              void* combined_x, float* combined_topk_weights,
@@ -125,7 +127,9 @@ void combine(cudaDataType_t type,
              int num_tokens, int num_combined_tokens, int hidden, int num_topk,
              void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
              void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
-             int rank, int num_ranks, cudaStream_t stream, int num_channels, bool low_latency_mode);
+             int rank, int num_ranks, cudaStream_t stream, int num_channels, bool low_latency_mode,
+             mscclpp::PortChannelDeviceHandle* port_channel_handles,
+             mscclpp::MemoryChannelDeviceHandle* memory_channel_handles);
 
 } // namespace internode
 
