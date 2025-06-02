@@ -735,11 +735,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         // Iterate all RDMA ranks
         int last_issued_tail = 0;
         while (__any_sync(0xffffffff, num_tokens_to_send > 0)) {
-            for (int i = 0; i < kNumRDMARanks; ++ i) {
-                __syncwarp();
-
+            #pragma unroll
+            for (int i = 0; i < kNumRDMARanks; ++i, __syncwarp()) {
                 // To mitigate incast congestion, shuffle the starting index of target rank for different ranks and channels
-                int dst_rdma_rank = (i + channel_id + rdma_rank) % kNumRDMARanks;
+                const int dst_rdma_rank = (i + channel_id + rdma_rank) % kNumRDMARanks;
                 if (lane_id != dst_rdma_rank) continue;
                 if (num_tokens_to_send == 0) continue;
 
@@ -1154,7 +1153,6 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
         const auto barrier_channel_idx = kLowLatencyMode ? threadIdx.x : (threadIdx.x * NUM_MAX_NVL_PEERS + nvl_rank);
         if (run_barrier) {
             port_channel_handles[barrier_channel_idx].signal();
-            port_channel_handles[barrier_channel_idx].flush();
             port_channel_handles[barrier_channel_idx].wait();
         }
         __syncthreads();
@@ -1635,25 +1633,22 @@ combine(int4* combined_x, float* combined_topk_weights,
 
                 // Issue RDMA send
                 if (sub_warp_id == kNumWarpsPerForwarder - 1) {
-                    if (dst_rdma_rank == rdma_rank) {
-                        memory_fence();
-                        __syncwarp();
-                        if (lane_id == 0) {
+                    if (lane_id == 0) {
+                        if (dst_rdma_rank == rdma_rank) {
                             mscclpp::atomicFetchAdd(reinterpret_cast<uint64_t*>(rdma_channel_tail.buffer(rdma_rank)), (uint64_t)num_chunked_tokens, mscclpp::memoryOrderRelease);
-                        }
-                    } else if (lane_id == 0) {
-                        auto rdma_slot_idx = token_start_idx % num_max_rdma_chunked_recv_tokens;
-                        const size_t num_bytes_per_msg = num_chunked_tokens * num_bytes_per_rdma_token;
-                        auto dst_offset = rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + rdma_slot_idx * num_bytes_per_rdma_token + data_recv_offset;
-                        auto src_offset = dst_rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + rdma_slot_idx * num_bytes_per_rdma_token + data_send_offset;
-                        auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
-                        auto& handle = port_channel_handles[port_channel_idx];
-                        handle.put(dst_offset, src_offset, num_bytes_per_msg);
+                        } else {
+                            auto rdma_slot_idx = token_start_idx % num_max_rdma_chunked_recv_tokens;
+                            const size_t num_bytes_per_msg = num_chunked_tokens * num_bytes_per_rdma_token;
+                            auto dst_offset = rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + rdma_slot_idx * num_bytes_per_rdma_token + data_recv_offset;
+                            auto src_offset = dst_rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + rdma_slot_idx * num_bytes_per_rdma_token + data_send_offset;
+                            auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
+                            auto& handle = port_channel_handles[port_channel_idx];
+                            handle.put(dst_offset, src_offset, num_bytes_per_msg);
 
-                        mscclpp::ChannelTrigger trigger(0, handle.dst_, rdma_rank * sizeof(uint64_t) + tail_send_offset, 0, 0, 1, handle.semaphoreId_);
-                        trigger.value.fst = num_chunked_tokens;
-                        handle.fifo_.push(trigger.value);
-                        // handle.flush();
+                            mscclpp::ChannelTrigger trigger(0, handle.dst_, rdma_rank * sizeof(uint64_t) + tail_send_offset, 0, 0, 1, handle.semaphoreId_);
+                            trigger.value.fst = num_chunked_tokens;
+                            handle.fifo_.push(trigger.value);
+                        }
                     }
                     __syncwarp();
                 }
