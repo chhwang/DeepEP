@@ -28,6 +28,8 @@ link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib ${NVSH
 
 add_subdirectory(kernels)
 
+add_subdirectory(../third-party/msccpp)
+
 # Link CPP and CUDA together
 pybind11_add_module(deep_ep_cpp deep_ep.cpp)
-target_link_libraries(deep_ep_cpp PRIVATE ${EP_CUDA_LIBRARIES} ${TORCH_LIBRARIES} torch_python)
+target_link_libraries(deep_ep_cpp PRIVATE ${EP_CUDA_LIBRARIES} ${TORCH_LIBRARIES} torch_python mscclpp)

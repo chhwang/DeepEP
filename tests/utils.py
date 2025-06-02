@@ -1,10 +1,34 @@
 import os
 import sys
+import psutil
 import numpy as np
 import torch
 import torch.distributed as dist
 from typing import Optional
 
+import ctypes
+
+# Load libnuma
+libnuma = ctypes.CDLL("libnuma.so")
+libnuma.numa_available.restype = ctypes.c_int
+libnuma.numa_run_on_node.argtypes = [ctypes.c_int]
+libnuma.numa_set_preferred.argtypes = [ctypes.c_int]
+
+def set_numa_affinity(rank):
+    cores_per_rank = 12
+    numa_node = rank // 4
+    core_start = rank * cores_per_rank
+    core_end = core_start + cores_per_rank
+    p = psutil.Process(os.getpid())
+    p.cpu_affinity(list(range(core_start, core_end)))
+    print(f"Rank {rank} numa node {numa_node} bound to cores {core_start}-{core_end - 1}")
+
+       # Bind memory to NUMA node
+    if libnuma.numa_available() != -1:
+        libnuma.numa_set_preferred(numa_node)
+        print(f"Rank {rank}: CPU affinity → cores {core_start}-{core_end - 1}, memory NUMA → node {numa_node}")
+    else:
+        print(f"Rank {rank}: libnuma not available")
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
@@ -20,6 +44,7 @@ def init_dist(local_rank: int, num_local_ranks: int):
         world_size=num_nodes * num_local_ranks,
         rank=node_rank * num_local_ranks + local_rank
     )
+    set_numa_affinity(local_rank)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device('cuda')
     torch.cuda.set_device(local_rank)

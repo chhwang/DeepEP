@@ -30,9 +30,6 @@ void barrier(int** task_fifo_ptrs, int head, int rank, int num_ranks, cudaStream
 
 namespace internode {
 
-nvshmem_team_t cpu_rdma_team = NVSHMEM_TEAM_INVALID;
-nvshmem_team_config_t cpu_rdma_team_config;
-
 std::vector<uint8_t> get_unique_id() {
     nvshmemx_uniqueid_t unique_id;
     nvshmemx_get_uniqueid(&unique_id);
@@ -47,16 +44,6 @@ int init(const std::vector<uint8_t> &root_unique_id_val, int rank, int num_ranks
     std::memcpy(&root_unique_id, root_unique_id_val.data(), sizeof(nvshmemx_uniqueid_t));
     nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
     nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
-
-    // Create sub-RDMA teams
-    // NOTES: if `num_ranks <= NUM_MAX_NVL_PEERS` then only low-latency kernels are used
-    if (low_latency_mode and num_ranks > NUM_MAX_NVL_PEERS) {
-        EP_HOST_ASSERT(cpu_rdma_team == NVSHMEM_TEAM_INVALID);
-        EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
-        EP_HOST_ASSERT(nvshmem_team_split_strided(NVSHMEM_TEAM_WORLD, rank % NUM_MAX_NVL_PEERS, NUM_MAX_NVL_PEERS,
-                                                  num_ranks / NUM_MAX_NVL_PEERS, &cpu_rdma_team_config, 0, &cpu_rdma_team) == 0);
-        EP_HOST_ASSERT(cpu_rdma_team != NVSHMEM_TEAM_INVALID);
-    }
 
     // TODO: we still use `nvshmem_barrier` under IBRC mode, which should be switch to IBGDA mode later
     nvshmemi_device_host_state_t* dev_state_ptr = nullptr;
@@ -81,10 +68,6 @@ void barrier() {
 }
 
 void finalize() {
-    if (cpu_rdma_team != NVSHMEM_TEAM_INVALID) {
-        nvshmem_team_destroy(cpu_rdma_team);
-        cpu_rdma_team = NVSHMEM_TEAM_INVALID;
-    }
     nvshmem_finalize();
 }
 
