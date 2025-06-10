@@ -8,6 +8,7 @@
 #include <pybind11/functional.h>
 #include <torch/python.h>
 #include <mscclpp/gpu_utils.hpp>
+#include <iostream>
 
 #include "deep_ep.hpp"
 #include "kernels/api.cuh"
@@ -108,6 +109,39 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
 }
 
 Buffer::~Buffer() noexcept(false) {
+    // Reset RDMA buffer before any potential event cleanup
+    // if (num_rdma_bytes > 0) {
+    //     // Ensure all operations are complete before resetting memory
+    //     // CUDA_CHECK(cudaDeviceSynchronize());
+    //     CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+    // }
+    if (rdma_buffer_ptr == nullptr) {
+        printf("Buffer destructor, rdma_biff_ptr is nullptr\n");
+    } else {
+        cudaPointerAttributes attributes;
+        cudaError_t err = cudaPointerGetAttributes(&attributes, rdma_buffer_ptr);
+        if (err == cudaSuccess) {
+            std::cout << "rdma_buffer_ptr is valid, memory type: " << attributes.type << std::endl;
+        } else {
+            std::cout << "rdma_buffer_ptr is invalid: " << cudaGetErrorString(err) << std::endl;
+        }
+    }
+
+    std::cout << "Checking comm_stream before cudaDeviceSynchronize" << std::endl;
+    cudaError_t stream_status = cudaStreamQuery(comm_stream);
+    if (stream_status == cudaSuccess) {
+        std::cout << "comm_stream is idle" << std::endl;
+    } else if (stream_status == cudaErrorNotReady) {
+        std::cout << "comm_stream has pending operations" << std::endl;
+    } else {
+        std::cout << "comm_stream error: " << cudaGetErrorString(stream_status) << std::endl;
+    }
+
+    printf("Buffer destructor, before cudaDeviceSynchronize\n");
+    CUDA_CHECK(cudaDeviceSynchronize());
+    printf("Buffer destructor, after cudaDeviceSynchronize\n");
+    CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+
     // Synchronize
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -131,7 +165,16 @@ Buffer::~Buffer() noexcept(false) {
     if (num_rdma_bytes > 0) {
         CUDA_CHECK(cudaDeviceSynchronize());
         internode::barrier();
-        internode::free(rdma_buffer_ptr);
+        //internode::free(rdma_buffer_ptr);
+        // CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+
+        // Important: Set rdma_buffer_ptr to nullptr BEFORE freeing the memory
+        // This prevents internode::finalize() from using the freed memory
+        void* temp_ptr = rdma_buffer_ptr;
+        rdma_buffer_ptr = nullptr;
+        rdma_buffer.reset();
+        // rdma_buffer_ptr.reset();
+
         internode::finalize();
     }
 
@@ -287,7 +330,17 @@ void Buffer::sync(const std::vector<int> &device_ids,
         internode::barrier();
 
         // Allocate
-        rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+        // rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+        // rdma_buffer = mscclpp::GpuBuffer<char>(num_rdma_bytes); // Create with alignment
+        rdma_buffer = std::make_unique<mscclpp::GpuBuffer<char>>(num_rdma_bytes);
+        // rdma_buffer_ptr = rdma_buffer->data(); // Get pointer to use in your code
+        uintptr_t raw_ptr = reinterpret_cast<uintptr_t>(rdma_buffer->data());
+        uintptr_t aligned_ptr = (raw_ptr + NUM_BUFFER_ALIGNMENT_BYTES - 1) & ~(NUM_BUFFER_ALIGNMENT_BYTES - 1);
+        rdma_buffer_ptr = reinterpret_cast<void*>(aligned_ptr);
+
+        // rdma_buffer_ptr = rdma_buffer.memory(); // Get pointer to use in your code
+        // rdma_buffer_ptr = rdma_buffer->memory().get(); // Get pointer to use in your code
+        // rdma_buffer_ptr = std::make_shared<mscclpp::GpuBuffer<char>>(num_rdma_bytes);
 
         // Clean buffer (mainly for low-latency mode)
         CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));

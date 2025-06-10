@@ -13,6 +13,7 @@
 #include <mscclpp/core.hpp>
 #include <mscclpp/port_channel.hpp>
 #include <mscclpp/memory_channel.hpp>
+#include <mscclpp/gpu_utils.hpp>
 
 #include "config.hpp"
 #include "event.hpp"
@@ -40,6 +41,9 @@ private:
 
     // NVSHMEM Buffer
     int64_t num_rdma_bytes;
+    // mscclpp::GpuBuffer<char> rdma_buffer;
+    std::unique_ptr<mscclpp::GpuBuffer<char>> rdma_buffer;
+    // std::shared_ptr<mscclpp::GpuBuffer<char>> rdma_buffer_ptr;
     void* rdma_buffer_ptr = nullptr;
 
     // Device info and communication
