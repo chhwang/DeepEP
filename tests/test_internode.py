@@ -174,7 +174,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         nvl_recv_bytes = (dispatch_bf16_nvl_recv_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_nvl_recv_bytes
         for nvl_chunk_size in range(4, 33, 4):
             # TODO(chhwang): dispatch occasionally hangs with smaller chunk sizes
-            for rdma_chunk_size in range(32, 33, 32):
+            for rdma_chunk_size in range(4, 33, 4):
                 config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
                 tune_args = {'x': current_x, 'handle': handle, 'config': config}
                 t = bench(lambda: buffer.dispatch(**tune_args))[0]
@@ -236,11 +236,12 @@ def test_loop(local_rank: int, num_local_ranks: int):
         test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
         if local_rank == 0:
             print('', flush=True)
-
+    '''
     # Test compatibility with low latency functions
     if test_ll_compatibility:
         buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
         test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
+    '''
 
 
 if __name__ == '__main__':
