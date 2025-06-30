@@ -42,7 +42,7 @@ private:
     // NVSHMEM Buffer
     int64_t num_rdma_bytes;
     // mscclpp::GpuBuffer<char> rdma_buffer;
-    std::unique_ptr<mscclpp::GpuBuffer<char>> rdma_buffer;
+    //std::unique_ptr<mscclpp::GpuBuffer<char>> rdma_buffer;
     // std::shared_ptr<mscclpp::GpuBuffer<char>> rdma_buffer_ptr;
     void* rdma_buffer_ptr = nullptr;
 

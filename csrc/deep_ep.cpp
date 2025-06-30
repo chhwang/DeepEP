@@ -8,7 +8,7 @@
 #include <pybind11/functional.h>
 #include <torch/python.h>
 #include <mscclpp/gpu_utils.hpp>
-#include <iostream>
+//#include <iostream>
 
 #include "deep_ep.hpp"
 #include "kernels/api.cuh"
@@ -32,10 +32,11 @@ EPProxyService::EPProxyService(size_t fifoSize) : mscclpp::ProxyService(fifoSize
                 uint64_t value = triggerRaw.fst;
                 semaphore->connection()->atomicAdd(dst, trigger->fields.dstOffset, value);
                 inflightRequests_[semaphore->connection()]++;
+                semaphore->connection()->flush();
+                // inflightRequests_[semaphore->connection()] = 0;
             }
             return this->handleTrigger(triggerRaw);
-        },
-        [&]() { this->bindThread(); }, fifoSize
+        }, fifoSize
     );
 }
 
@@ -109,6 +110,7 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
 }
 
 Buffer::~Buffer() noexcept(false) {
+/*
     // Reset RDMA buffer before any potential event cleanup
     // if (num_rdma_bytes > 0) {
     //     // Ensure all operations are complete before resetting memory
@@ -141,6 +143,7 @@ Buffer::~Buffer() noexcept(false) {
     CUDA_CHECK(cudaDeviceSynchronize());
     printf("Buffer destructor, after cudaDeviceSynchronize\n");
     CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+*/
 
     // Synchronize
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -165,7 +168,8 @@ Buffer::~Buffer() noexcept(false) {
     if (num_rdma_bytes > 0) {
         CUDA_CHECK(cudaDeviceSynchronize());
         internode::barrier();
-        //internode::free(rdma_buffer_ptr);
+        internode::free(rdma_buffer_ptr);
+/*
         // CUDA_CHECK(cudaStreamSynchronize(comm_stream));
 
         // Important: Set rdma_buffer_ptr to nullptr BEFORE freeing the memory
@@ -174,6 +178,7 @@ Buffer::~Buffer() noexcept(false) {
         rdma_buffer_ptr = nullptr;
         rdma_buffer.reset();
         // rdma_buffer_ptr.reset();
+*/
 
         internode::finalize();
     }
@@ -330,7 +335,8 @@ void Buffer::sync(const std::vector<int> &device_ids,
         internode::barrier();
 
         // Allocate
-        // rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+        rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+/*
         // rdma_buffer = mscclpp::GpuBuffer<char>(num_rdma_bytes); // Create with alignment
         rdma_buffer = std::make_unique<mscclpp::GpuBuffer<char>>(num_rdma_bytes);
         // rdma_buffer_ptr = rdma_buffer->data(); // Get pointer to use in your code
@@ -341,7 +347,7 @@ void Buffer::sync(const std::vector<int> &device_ids,
         // rdma_buffer_ptr = rdma_buffer.memory(); // Get pointer to use in your code
         // rdma_buffer_ptr = rdma_buffer->memory().get(); // Get pointer to use in your code
         // rdma_buffer_ptr = std::make_shared<mscclpp::GpuBuffer<char>>(num_rdma_bytes);
-
+*/
         // Clean buffer (mainly for low-latency mode)
         CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
 
@@ -377,7 +383,7 @@ void Buffer::sync(const std::vector<int> &device_ids,
         connection_futures[rank].emplace_back(communicator->connect(rank, 0, ipc_transport));
 
         // Create connections to each remote memory
-        const int num_ib_connections_per_rank = low_latency_mode ? 12 : 12;  // #QPs per rank
+        const int num_ib_connections_per_rank = low_latency_mode ? 16 : 12;  // #QPs per rank
         for (auto& [r, memory_id] : memory_ids) {
             if (r == rank) continue;
             for (int i = 0; i < num_ib_connections_per_rank; ++i) {
@@ -389,7 +395,7 @@ void Buffer::sync(const std::vector<int> &device_ids,
         std::unordered_map<int, std::vector<mscclpp::SemaphoreId>> sema_ids;
 
         // Create semaphores for each connection
-        const int num_semaphores_per_rank = 16;
+        const int num_semaphores_per_rank = low_latency_mode ? 16 : 12;
         for (int i = 0; i < num_semaphores_per_rank; ++i) {
             for (auto& [r, conn_futures] : connection_futures) {
                 auto conn_future = conn_futures[i % conn_futures.size()];

@@ -217,6 +217,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         const auto barrier_channel_idx = kLowLatencyMode ? barrier_thread_id : (barrier_thread_id * NUM_MAX_NVL_PEERS + nvl_rank);
         if (run_barrier) {
             port_channel_handles[barrier_channel_idx].signal();
+            port_channel_handles[barrier_channel_idx].flush();
             port_channel_handles[barrier_channel_idx].wait();
         }
         if constexpr (!kLowLatencyMode) {
@@ -357,6 +358,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
 
         if (run_barrier) {
             port_channel_handles[barrier_channel_idx].signal();
+            port_channel_handles[barrier_channel_idx].flush();
             port_channel_handles[barrier_channel_idx].wait();
         }
         if constexpr (!kLowLatencyMode) {
@@ -498,21 +500,27 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
     const auto num_channels = static_cast<int>(gridDim.x) / 2, channel_id = sm_id / 2;
-    const bool is_forwarder = sm_id % 2 == 0;
+    const bool is_forwarder = sm_id % 2 == 0; // 4 sms. 1,3 for forwarders, 0,2 for receivers
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
 
+    // total number of warps 8 + 8 = 16
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
         if (is_forwarder) {
             if (warp_id < NUM_MAX_NVL_PEERS) {
+                // warp_id < 8. 8 wraps for NVL forwarders. For the target: 0-7 channelId 0, 1-7,0 channelId 1
                 return {WarpRole::kRDMAAndNVLForwarder, (warp_id + channel_id) % NUM_MAX_NVL_PEERS};
             } else {
+                // 8 warps for forwarder coordinator
                 return {WarpRole::kForwarderCoordinator, warp_id - NUM_MAX_NVL_PEERS};
             }
-        } else if (warp_id < kNumDispatchRDMASenderWarps) {
+        } else if (warp_id < kNumDispatchRDMASenderWarps) { // kNumDispatchRDMASenderWarps == 7
+            // warp_id < 7. 7 warps for RDMA senders
             return {WarpRole::kRDMASender, -1};
         } else if (warp_id == kNumDispatchRDMASenderWarps) {
+            // warp_id == 7. 1 warps for RDMA sender coordinator
             return {WarpRole::kRDMASenderCoordinator, -1};
         } else {
+            // warp_id > 7. 8 warps for NVL receivers
             return {WarpRole::kNVLReceivers, (warp_id + channel_id - kNumDispatchRDMASenderWarps) % NUM_MAX_NVL_PEERS};
         }
     }();
@@ -609,6 +617,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
                 port_channel_handles[port_channel_idx].put(dst_offset, src_offset, num_bytes);
                 // port_channel_handles[port_channel_idx].flush();
+                // for (int i = 0; i < NUM_MAX_NVL_PEERS * 2 + 2; ++i) {
+                //     printf("Rank %d, channel %d, dst_rdma_rank %d, lane_id %d, meta[%d] = %d\n",
+                //            rank, channel_id, dst_rdma_rank, lane_id, i, dst_ptr[i]);
+                // }
             }
             __syncwarp();
         }
@@ -633,7 +645,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             if (is_token_in_rank_uint64 != 0) {
                 rdma_tail_idx = rdma_send_channel_next_tail[lane_id] ++;
                 while (rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens)
-                    cached_rdma_channel_head = static_cast<int>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
+                    cached_rdma_channel_head = static_cast<int>(ld_acquire_sys_global(rdma_channel_head.buffer(lane_id)));
             }
             __syncwarp();
 
@@ -645,6 +657,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             if (last_rdma_tail_idx >= 0)
                 st_release_cta(const_cast<const int *>(rdma_send_channel_tail + lane_id), last_rdma_tail_idx + 1);
             last_rdma_tail_idx = rdma_tail_idx;
+             __syncwarp();
 
             // Release sequential lock
             lane_id == 0 ? (rdma_send_next_token_idx += 1) : 0;
@@ -763,15 +776,22 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     const auto src_offset = dst_rdma_rank * (num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token) + dst_slot_idx * num_bytes_per_rdma_token + data_send_offset;
                     const auto port_channel_idx = kLowLatencyMode ? (channel_id * kNumRDMARanks + dst_rdma_rank) : (channel_id * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank);
                     auto& handle = port_channel_handles[port_channel_idx];
+                    EP_DEVICE_ASSERT(last_issued_tail + num_tokens_to_issue < num_max_rdma_chunked_recv_tokens);
                     handle.put(dst_offset, src_offset, num_bytes_per_msg);
+
+                    // if (rdma_rank == 0) {
+                    //     printf("DeepEP dispatch trigger dst: %d src %d port channel: %d tokens: %d, offset: %ld, src offset: %ld, lanid %d i is %d kNumRDMARanks is %d kNumDispatchRDMASenderWarps %d\n",
+                    //            dst_rdma_rank, rdma_rank, port_channel_idx, num_tokens_to_issue, dst_offset, src_offset, lane_id, i, kNumRDMARanks, kNumDispatchRDMASenderWarps);
+                    // }
 
                     mscclpp::ChannelTrigger trigger(0, handle.dst_, rdma_rank * sizeof(uint64_t) + tail_send_offset, 0, 0, 1, handle.semaphoreId_);
                     trigger.value.fst = num_tokens_to_issue;
                     handle.fifo_.push(trigger.value);
-                    // handle.flush();
+                    handle.flush();
                 }
                 last_issued_tail += num_tokens_to_issue;
                 num_tokens_to_send -= num_tokens_to_issue;
+                // __syncwarp();
             }
         }
     } else if (warp_role == WarpRole::kRDMAAndNVLForwarder) {
@@ -786,6 +806,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
         auto start_time = clock64();
         if (lane_id < kNumRDMARanks) {
+            // printf("DeepEP dispatch forwarder waiting for RDMA meta, channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d\n",
+            //        channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank);
             while (true) {
                 auto meta_0 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
                 auto meta_1 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS + dst_nvl_rank);
@@ -837,7 +859,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
                 if (num_max_nvl_chunked_recv_tokens - num_used_slots >= num_max_nvl_chunked_send_tokens)
                     break;
-                cached_nvl_channel_head = ld_volatile_global(nvl_channel_head.buffer());
+                cached_nvl_channel_head = ld_acquire_sys_global(nvl_channel_head.buffer());
 
                 // Timeout check
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
@@ -927,14 +949,20 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     src_rdma_tail = i + 1;
             }
 
+            __syncwarp();
             // Sync head index
             if (lane_id == src_rdma_rank)
                 forward_channel_head[dst_nvl_rank][src_rdma_rank] = (cached_rdma_channel_head = src_rdma_tail);
 
             // Move tail index
             __syncwarp();
-            if (lane_id == 0)
+            if (lane_id == 0) {
+                // printf("DeepEP dispatch forwarder RDMA rank %d, channel %d, nvl %d, src RDMA %d, dst NVL %d, head: %d, tail: %d, tokens: %d\n",
+                //        rdma_rank, channel_id, nvl_rank, src_rdma_rank, dst_nvl_rank,
+                //        cached_rdma_channel_head, cached_nvl_channel_tail, num_tokens_to_recv_from_rdma);
                 st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
+            }
+            __syncwarp();
         }
 
         // Retired
@@ -982,6 +1010,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 }
                 last_head = min_head;
             }
+            __syncwarp();
 
             // Nanosleep and let other warps work
             __nanosleep(NUM_WAIT_NANOSECONDS);
@@ -1032,8 +1061,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
                 // Timeout check
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                    printf("DeepEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, head: %d, tail: %d\n",
-                           channel_id, rdma_rank, nvl_rank, src_nvl_rank, cached_channel_head_idx, cached_channel_tail_idx);
+                    printf("DeepEP dispatch NVL receiver 2 timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, head: %d, tail: %d, num_tokens_to_recv is %d\n",
+                           channel_id, rdma_rank, nvl_rank, src_nvl_rank, cached_channel_head_idx, cached_channel_tail_idx, num_tokens_to_recv);
                     trap();
                 }
             }
@@ -1077,7 +1106,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             // Move queue
             __syncwarp();
             if (lane_id == 0)
-                st_relaxed_sys_global(nvl_channel_head.buffer(), cached_channel_head_idx);
+                st_release_sys_global(nvl_channel_head.buffer(), cached_channel_head_idx);
         }
     }
 }
@@ -1153,6 +1182,7 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
         const auto barrier_channel_idx = kLowLatencyMode ? threadIdx.x : (threadIdx.x * NUM_MAX_NVL_PEERS + nvl_rank);
         if (run_barrier) {
             port_channel_handles[barrier_channel_idx].signal();
+            port_channel_handles[barrier_channel_idx].flush();
             port_channel_handles[barrier_channel_idx].wait();
         }
         __syncthreads();
