@@ -27,7 +27,7 @@ if __name__ == '__main__':
 
     # Disable DLTO (default by PyTorch)
     nvcc_dlink = ['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem']
-    extra_link_args = ['-l:libnvshmem.a', '-l:nvshmem_bootstrap_uid.so', f'-Wl,-rpath,{nvshmem_dir}/lib']
+    extra_link_args = ['-l:libnvshmem.a', '-l:nvshmem_bootstrap_uid.so', f'-Wl,-rpath,{nvshmem_dir}/lib', '-lmscclpp']
     extra_compile_args = {
         'cxx': cxx_flags,
         'nvcc': nvcc_flags,
