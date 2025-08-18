@@ -2,9 +2,11 @@
 #include <ATen/cuda/CUDADataType.h>
 #include <chrono>
 #include <cuda_runtime.h>
+#include <map>
 #include <memory>
 #include <pybind11/functional.h>
 #include <torch/python.h>
+#include <mscclpp/gpu_utils.hpp>
 
 #include "deep_ep.hpp"
 #include "kernels/api.cuh"
@@ -12,12 +14,36 @@
 
 namespace deep_ep {
 
+class EPProxyService : public mscclpp::ProxyService {
+public:
+    EPProxyService(size_t fifoSize = 512);
+};
+
+EPProxyService::EPProxyService(size_t fifoSize) : mscclpp::ProxyService(fifoSize) {
+    // Overwrite the default proxy
+    proxy_ = std::make_shared<mscclpp::Proxy>(
+        [&](mscclpp::ProxyTrigger trigger) {
+            if (trigger.fields.type == 0x0) {  // regard 0x0 as an IB atomicAdd request
+                auto semaphore = semaphores_[trigger.fields.semaphoreId];
+                auto& dst = memories_[trigger.fields.dstMemoryId];
+                uint64_t value = trigger.fst;
+                semaphore->connection()->atomicAdd(dst, trigger.fields.dstOffset, value);
+                inflightRequests_[semaphore->connection()]++;
+            }
+            return this->handleTrigger(trigger);
+        },
+        fifoSize
+    );
+}
+
 Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode, bool explicitly_destroy):
         rank(rank), num_ranks(num_ranks),
         num_nvl_bytes(num_nvl_bytes), num_rdma_bytes(num_rdma_bytes),
         low_latency_mode(low_latency_mode),
         explicitly_destroy(explicitly_destroy),
-        comm_stream(at::cuda::getStreamFromPool(true)) {
+        comm_stream(at::cuda::getStreamFromPool(true)),
+        bootstrap(std::make_shared<mscclpp::TcpBootstrap>(rank, num_ranks)),
+        proxy_service(std::make_shared<EPProxyService>()) {
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
@@ -79,6 +105,8 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_rdma_counter_mapped, const_cast<int*>(moe_recv_rdma_counter), 0));
         *moe_recv_rdma_counter = -1;
     }
+
+    proxy_service->startProxy();
 }
 
 Buffer::~Buffer() noexcept(false) {
@@ -171,6 +199,8 @@ void Buffer::destroy() {
     }
 #endif
 
+    proxy_service->stopProxy();
+
     // Free workspace and MoE counter
     CUDA_CHECK(cudaFree(workspace));
     CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_counter)));
@@ -182,10 +212,26 @@ void Buffer::destroy() {
     available = false;
 }
 
+mscclpp::UniqueId Buffer::create_unique_id() const {
+    return bootstrap->createUniqueId();
+}
+
+void Buffer::connect(mscclpp::UniqueId root_id) {
+    bootstrap->initialize(root_id);
+    communicator = std::make_shared<mscclpp::Communicator>(bootstrap);
+}
+
 void Buffer::sync(const std::vector<int> &device_ids,
                   const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
     EP_HOST_ASSERT(not is_available());
+
+    const std::vector<mscclpp::Transport> ib_transports = {mscclpp::Transport::IB0, mscclpp::Transport::IB1,
+        mscclpp::Transport::IB2, mscclpp::Transport::IB3, mscclpp::Transport::IB4,
+        mscclpp::Transport::IB5, mscclpp::Transport::IB6, mscclpp::Transport::IB7};
+    const auto ipc_transport = mscclpp::Transport::CudaIpc;
+    const auto ib_transport = ib_transports[device_id];
+    const mscclpp::TransportFlags all_transport = ipc_transport | ib_transport;
 
     // Sync IPC handles
     if (num_nvl_bytes > 0) {
@@ -208,6 +254,47 @@ void Buffer::sync(const std::vector<int> &device_ids,
         CUDA_CHECK(cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs, sizeof(void*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaDeviceSynchronize());
+
+        // build connections and create semaphores
+        std::map<int, mscclpp::Semaphore> semaphores;
+        {
+            std::map<int, std::shared_future<std::shared_ptr<mscclpp::Connection>>> connection_futures;
+            std::map<int, std::shared_future<mscclpp::Semaphore>> semaphore_futures;
+            for (int i = 0; i < num_nvl_ranks; ++i) {
+                auto r = i + rdma_rank * num_nvl_ranks;
+                connection_futures.emplace(r, communicator->connect(ipc_transport, r));
+            }
+            for (auto& [r, conn_future] : connection_futures) {
+                semaphore_futures.emplace(r, communicator->buildSemaphore(conn_future.get(), r));
+            }
+            for (auto& [r, sema_future] : semaphore_futures) {
+                semaphores.emplace(r, sema_future.get());
+            }
+        }
+
+        auto buffer_mem = communicator->registerMemory(buffer_ptrs[nvl_rank], num_nvl_bytes, ipc_transport);
+
+        std::map<int, std::shared_future<mscclpp::RegisteredMemory>> remote_mem_futures;
+        for (int i = 0; i < num_nvl_ranks; ++i) {
+            if (i == nvl_rank) continue;
+            auto r = i + rdma_rank * num_nvl_ranks;
+            communicator->sendMemory(buffer_mem, r);
+            remote_mem_futures.emplace(r, communicator->recvMemory(r));
+        }
+        for (auto& [r, mem_future] : remote_mem_futures) {
+            memory_channels.emplace(r, std::move(mscclpp::MemoryChannel(semaphores.at(r), mem_future.get(), buffer_mem)));
+        }
+        std::vector<mscclpp::MemoryChannelDeviceHandle> memory_channel_handles(num_nvl_ranks);
+        for (int i = 0; i < num_nvl_ranks; ++i) {
+            if (i == nvl_rank) continue;
+            auto r = i + rdma_rank * num_nvl_ranks;
+            memory_channel_handles[i] = memory_channels.at(r).deviceHandle();
+        }
+        memory_channel_handles_device_ptr = mscclpp::detail::gpuCallocShared<mscclpp::MemoryChannelDeviceHandle>(num_nvl_ranks);
+        // handle for the local rank is currently empty
+        mscclpp::gpuMemcpy<mscclpp::MemoryChannelDeviceHandle>(
+            memory_channel_handles_device_ptr.get(), memory_channel_handles.data(), num_nvl_ranks,
+            cudaMemcpyHostToDevice);
     }
 
     // Sync NVSHMEM handles and allocate memory
@@ -234,6 +321,84 @@ void Buffer::sync(const std::vector<int> &device_ids,
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 #endif
+
+    if (num_rdma_bytes > 0) {
+        // Rank -> RDMA buffer IDs
+        std::map<int, mscclpp::MemoryId> memory_ids;
+
+        // Register local memory
+        auto local_rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, all_transport);
+        memory_ids[rank] = proxy_service->addMemory(local_rdma_buffer_mem);
+
+        // Send local memory to other ranks. If low_latency_mode == true, only send to ranks with the same GPU ID.
+        for (int r = 0; r < num_ranks; ++r) {
+            if (r == rank) continue;
+            if (low_latency_mode && ((r % NUM_MAX_NVL_PEERS) != (rank % NUM_MAX_NVL_PEERS))) continue;
+            communicator->sendMemory(local_rdma_buffer_mem, r);
+        }
+
+        // Receive remote memory from other ranks. If low_latency_mode == true, only send to ranks with the same GPU ID.
+        for (int r = 0; r < num_ranks; ++r) {
+            if (r == rank) continue;
+            if (low_latency_mode && ((r % NUM_MAX_NVL_PEERS) != (rank % NUM_MAX_NVL_PEERS))) continue;
+            memory_ids[r] = proxy_service->addMemory(communicator->recvMemory(r).get());
+        }
+
+        // Rank -> vector of connection futures
+        std::unordered_map<int, std::vector<std::shared_future<std::shared_ptr<mscclpp::Connection>>>> connection_futures;
+        std::unordered_map<int, std::vector<std::shared_future<mscclpp::Semaphore>>> semaphore_futures;
+
+        // Create a self connection to local memory
+        connection_futures[rank].emplace_back(communicator->connect(ipc_transport, rank));
+        // connection_futures[rank].emplace_back(communicator->connect(ib_transport, rank));
+
+        // Create connections to each remote memory
+        const int num_ib_connections_per_rank = low_latency_mode ? 16 : 16;  // #QPs per rank
+        for (int r = 0; r < num_ranks; ++r) {
+            if (r == rank) continue;
+            for (int i = 0; i < num_ib_connections_per_rank; ++i) {
+                connection_futures[r].emplace_back(communicator->connect(ib_transport, r));
+            }
+        }
+
+        // Create semaphores
+        for (auto& [r, conn_futures] : connection_futures) {
+            for (auto& conn_future : conn_futures) {
+                semaphore_futures[r].emplace_back(communicator->buildSemaphore(conn_future.get(), r));
+            }
+        }
+
+        // Rank -> vector of semaphore IDs
+        std::unordered_map<int, std::vector<mscclpp::SemaphoreId>> sema_ids;
+
+        // Create semaphores for each connection
+        for (auto& [r, sema_futures] : semaphore_futures) {
+            for (auto& sema_future : sema_futures) {
+                auto sema_id = proxy_service->addSemaphore(sema_future.get());
+                sema_ids[r].emplace_back(sema_id);
+            }
+        }
+
+        // Create port channels and port channel handles.
+        // If low_latency_mode is true, the length of `port_channel_handles` will be
+        // `num_rdma_ranks * num_port_channels_per_rank`, otherwise it will be
+        // `num_ranks * num_port_channels_per_rank`.
+        const int num_port_channels_per_rank = num_ib_connections_per_rank;
+        std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles;
+        for (int i = 0; i < num_port_channels_per_rank; ++i) {
+            for (auto& [r, memory_id] : memory_ids) {
+                auto sema_id = sema_ids[r][i % sema_ids[r].size()];
+                auto port_channel = proxy_service->portChannel(sema_id, memory_id, memory_ids[rank]);
+                port_channels.emplace(r, std::move(port_channel));
+                port_channel_handles.emplace_back(port_channels.at(r).deviceHandle());
+            }
+        }
+
+        port_channel_handles_device_ptr = mscclpp::detail::gpuCallocShared<mscclpp::PortChannelDeviceHandle>(port_channel_handles.size());
+        mscclpp::gpuMemcpy<mscclpp::PortChannelDeviceHandle>(
+            port_channel_handles_device_ptr.get(), port_channel_handles.data(), port_channel_handles.size(),
+            cudaMemcpyHostToDevice);
+    }
 
     // Ready to use
     available = true;
@@ -789,7 +954,9 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                  buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                                  barrier_signal_ptrs_gpu, rank, comm_stream,
                                  config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                                 num_nvl_bytes, true, low_latency_mode);
+                                 num_nvl_bytes, true, low_latency_mode,
+                                 port_channel_handles_device_ptr.get(),
+                                 memory_channel_handles_device_ptr.get());
     } else {
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -811,7 +978,9 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                    buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                                    barrier_signal_ptrs_gpu, rank, comm_stream,
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                                   num_nvl_bytes, low_latency_mode);
+                                   num_nvl_bytes, low_latency_mode,
+                                   port_channel_handles_device_ptr.get(),
+                                   memory_channel_handles_device_ptr.get());
 
         // Synchronize total received tokens and tokens per expert
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -888,7 +1057,9 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                         rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
                         buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
                         rank, num_ranks, cached_mode,
-                        comm_stream, num_channels, low_latency_mode);
+                        comm_stream, num_channels, low_latency_mode,
+                        port_channel_handles_device_ptr.get(),
+                        memory_channel_handles_device_ptr.get());
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1006,7 +1177,9 @@ Buffer::internode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                              buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
                              barrier_signal_ptrs_gpu, rank, comm_stream,
                              config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-                             num_nvl_bytes, false, low_latency_mode);
+                             num_nvl_bytes, false, low_latency_mode,
+                             port_channel_handles_device_ptr.get(),
+                             memory_channel_handles_device_ptr.get());
     
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
@@ -1030,7 +1203,9 @@ Buffer::internode_combine(const torch::Tensor& x, const std::optional<torch::Ten
                        num_tokens, num_combined_tokens, hidden, num_topk,
                        rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
                        buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
-                       rank, num_ranks, comm_stream, num_channels, low_latency_mode);
+                       rank, num_ranks, comm_stream, num_channels, low_latency_mode,
+                       port_channel_handles_device_ptr.get(),
+                       memory_channel_handles_device_ptr.get());
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1366,6 +1541,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
         .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
         .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
+        .def("create_unique_id", &deep_ep::Buffer::create_unique_id)
+        .def("connect", &deep_ep::Buffer::connect)
         .def("sync", &deep_ep::Buffer::sync)
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)

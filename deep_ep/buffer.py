@@ -106,6 +106,13 @@ class Buffer:
             dist.all_gather_object(nvshmem_unique_ids, root_unique_id, group)
             root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
 
+        unique_id = [None,]
+        if self.rank == 0:
+            unique_id[0] = self.runtime.create_unique_id()
+        dist.broadcast_object_list(unique_id, src=0, group=group)
+
+        self.runtime.connect(unique_id[0])
+
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
